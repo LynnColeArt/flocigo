@@ -21,9 +21,11 @@ Legend: [x] ported+golden-diffed · [ ] queued · (K) kernel ticket
 CreateQueue, ListQueues, SendMessage, ReceiveMessage (long-poll), DeleteMessage,
 Get/SetQueueAttributes, visibility timeout, DLQ redrive.
 
-## DynamoDB (queued)
-CreateTable, DescribeTable, PutItem, GetItem, DeleteItem, UpdateItem, Query,
-Scan, BatchWriteItem, TransactWriteItems (incl. condition/update expressions).
+## DynamoDB (queued, 14 tickets: 12–19 + 30–34)
+CreateTable · DescribeTable · ListTables · DeleteTable · PutItem · GetItem ·
+DeleteItem · UpdateItem · Query · Scan · BatchGetItem · BatchWriteItem ·
+TransactWriteItems · TransactGetItems · ExecuteStatement (PartiQL, conditional)
+Kernel: expression engine (condition + update evaluator, expression syntax)
 
 Oracle: Floci authority on 127.0.0.1:8000 (Docker host-side; ported code ships
 client-side). Recording gate: FLOCI_RECORD=1 with authority reachable.
