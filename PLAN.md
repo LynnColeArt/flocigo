@@ -1,4 +1,4 @@
-# floci-go: function-by-function port plan
+# flocigo: function-by-function port plan
 
 ## Program of record
 

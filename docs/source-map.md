@@ -20,7 +20,7 @@ License: MIT — port is legal with attribution (keep NOTICE with floci-io copyr
 - SQS: create queue, send, receive, delete, attributes, visibility.
 - DDB: create/describe table, put/get/delete/update item, query, batch, transactions (if sugarbit uses them — confirm from surface recording).
 
-## Kernel tickets (Go, in floci-go)
+## Kernel tickets (Go, in flocigo)
 
 The kernel (~3–4K LOC of Go estimated) is where the real work concentrates:
 

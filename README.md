@@ -1,4 +1,4 @@
-# floci-go
+# flocigo
 
 Client-side Go port of the Floci AWS emulator: **S3, SQS, DynamoDB** — zero
 runtime dependencies, one static binary, no Docker, embeddable as a library.
