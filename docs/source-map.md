@@ -9,7 +9,7 @@ Ground truth by service (java files · LOC · where the wire functions live):
 |---|---:|---:|---:|---:|---|
 | SQS | 17 | 5,343 | 5 | 3,971 | SqsQueryHandler (query/XML). Port FIRST — smallest, full protocol adapter exercise. |
 | S3 | 67 | 23,187 | 4 | 14,566 | S3Service 8.8K LOC: versioning, multipart, presigned, CORS, lifecycle, S3 Select, CloudFront OAC. Most is NOT needed for sugarbit v0 — envelope will scope. |
-| DynamoDB | 86 | 27,072 | 9 | 13,260 | NativeDynamoDbJsonHandler + expression engine. The grammar evaluator is the deep part. |
+| DynamoDB | 86 | 27,072 | 9 | 13,260 | NativeDynamoDbJsonHandler: 57 dispatch ops (16 sugarbit-scoped). Expression engine: ExpressionEvaluator (1,240 LOC) + PartiQL parser (2,181 LOC) + PartiQL handler (1,070 LOC) + key plan (386 LOC) + update syntax (322 LOC) + condition keys (557+101 LOC) = 4,965 LOC. 7 additional tickets added 2026-11-16. |
 | **Total** | **170** | **55,602** | **18** | **31,797** | |
 
 License: MIT — port is legal with attribution (keep NOTICE with floci-io copyright).

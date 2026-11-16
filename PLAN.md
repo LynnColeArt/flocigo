@@ -37,7 +37,8 @@ SigV4 canonical fix ──► Error taxonomy ──► Protocol adapters ──�
                              └── Presigned S3 op ──────┤
 
 S3 protocol adapter ──► S3 ops (6, in dependency order)
-DDB JSON adapter ──► DDB ops (9, expression engine is the deep kernel piece)
+DDB JSON adapter ──► DDB expression engine (kernel: condition + update evaluator) ──► DDB ops (13: CRUD, query, scan, batch, transactions)
+DDB JSON adapter ──► DDB PartiQL engine (kernel, if sugarbit uses PartiQL) ──► PartiQL op
 SQS query adapter ──► SQS ops (5, long-poll timing is the deep kernel piece)
 DDB JSON adapter ──► EB pattern engine ──► EB ops (bus CRUD + targets + ingress)
 ```
