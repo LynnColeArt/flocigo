@@ -19,11 +19,9 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 		{"GET", "/bucket/obj.bin", ""},
 		{"DELETE", "/bucket/obj", ""},
 	} {
-		req := httptest.NewRequest(tc.method, "http://127.0.0.1:9000"+tc.path, nil)
-		if tc.body != "" {
-			req = httptest.NewRequest(tc.method, "http://127.0.0.1:9000"+tc.path, bytes.NewReader([]byte(tc.body)))
-		}
+		req := httptest.NewRequest(tc.method, "http://127.0.0.1:9000"+tc.path, bytes.NewReader([]byte(tc.body)))
 		req.Host = "127.0.0.1:9000"
+		req.Header.Set("X-Amz-Content-Type", "application/x-amz-json-1.0")
 		now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 		if e := Sign(req, "k", "s", testRegion, "s3", now); e != nil {
 			t.Fatal(e)
