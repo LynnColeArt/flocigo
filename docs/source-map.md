@@ -13,6 +13,22 @@ Ground truth by service (java files · LOC · where the wire functions live):
 | **Total** | **170** | **55,602** | **18** | **31,797** | |
 
 License: MIT — port is legal with attribution (keep NOTICE with floci-io copyright).
+License: MIT — port is legal with attribution (keep NOTICE with floci-io copyright).
+
+## EventBridge (added to queue)
+
+| | |
+|---|---|
+| Floci source | 39 Java files · 6,823 LOC (handler thin, 1075 LOC; service 2,529 LOC) |
+| Sugarbit scope | 15 ops (buses, rules, targets, ingress, pattern-test) |
+| Protocol | x-amz-json-1.0 — same as DDB, served by ticket 003 |
+| Kernel pieces | Pattern-match engine ~150 LOC (5 recursive JSON match methods); TargetDispatcher ~301 LOC (routes to SQS/Lambda/HTTP). Floci: TargetDispatcher.java, EventBridgeService.java lines 1354–1503 |
+| Tickets | 26 (kernel: pattern engine) · 27 (kernel: target dispatcher) · 28 (bus CRUD + rules) · 29 (targets + ingress) |
+| Dependencies | Ticket 003 (JSON adapter already in queue) + ticket 004 (SQS adapter for SQS targets) |
+
+Lambda targets: fail loudly (`NotImplemented(Lambda)`) until the execution model is decided.
+Scheduled rules (cron/rate): deferred — sugarbit doesn't need them in v0. Floci source has
+ScheduleExpressionParser.java (112 LOC) as reference when needed.
 
 ## What sugarbit v0 actually needs (envelope to be confirmed from sugarbit source)
 
