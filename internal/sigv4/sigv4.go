@@ -108,7 +108,7 @@ func canonicalize(req *http.Request, payload string) (string, string) {
 		"content-type":         strings.ToLower(req.Header.Get("Content-Type")),
 		"content-md5":          strings.ToLower(req.Header.Get("Content-Md5")),
 		"x-amz-content-sha256": payload,
-		"x-amz-date":           req.Header.Get("X-Amz-Date")}
+		"x-amz-date":           strings.ToLower(req.Header.Get("X-Amz-Date"))}
 	for k, vs := range req.Header {
 		lk := strings.ToLower(k)
 		if strings.HasPrefix(lk, "x-amz-") && lk != "x-amz-content-sha256" && lk != "x-amz-date" {
@@ -203,4 +203,10 @@ func Verify(req *http.Request, access, secret, region, service string) error {
 		return ErrSignature
 	}
 	return nil
+}
+
+func DebugCanonical(req *http.Request, payload string) (string, string) {
+	headers, names := canonicalize(req, payload)
+	canonical := strings.Join([]string{req.Method, canonicalURI(req), canonicalQuery(req), headers, names, payload}, "\n")
+	return canonical, names
 }

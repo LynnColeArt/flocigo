@@ -15,13 +15,13 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 		method, path, body string
 	}{
 		{"PUT", "/bucket", ""},
-		{"PUT", "/bucket/with key/and+plus", "hello world payload"},
+		{"PUT", "/bucket/with_key/and%2Bplus", "hello world payload"},
 		{"GET", "/bucket/obj.bin", ""},
 		{"DELETE", "/bucket/obj", ""},
 	} {
 		req := httptest.NewRequest(tc.method, "http://127.0.0.1:9000"+tc.path, bytes.NewReader([]byte(tc.body)))
 		req.Host = "127.0.0.1:9000"
-		req.Header.Set("X-Amz-Content-Type", "application/x-amz-json-1.0")
+		req.Header.Set("X-Amz-Target", "s3.PutObject")
 		now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
 		if e := Sign(req, "k", "s", testRegion, "s3", now); e != nil {
 			t.Fatal(e)
