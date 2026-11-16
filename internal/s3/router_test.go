@@ -2,7 +2,6 @@ package s3
 
 import (
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
