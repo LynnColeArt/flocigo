@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Factory lane for flocigo tickets. Reads open issues, runs model→edit→worker→publish per ticket, unsupervised."""
-import json, os, pathlib, subprocess, tempfile, time, hashlib
+import json, os, pathlib, subprocess, sys, tempfile, time, hashlib
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 REPO = "LynnColeArt/flocigo"
 AUTH = pathlib.Path(os.environ.get("FLEET_FACTORY_STATE", os.path.expanduser("~/.local/state/agent-fleet"))) / "authority"
