@@ -119,5 +119,38 @@ if __name__ == "__main__":
     elif sys.argv[1] == "run":
         raw = subprocess.check_output(["gh", "issue", "view", sys.argv[2], "--repo", REPO, "--json", "number,title,body"], text=True)
         iss = json.loads(raw)
-        ev = tempfile.mkdtemp(prefix="flocigo-lane-")
-        print(json.dumps(run_ticket(iss["number"], iss["title"], iss.get("body") or "", ev), indent=2))
+        for attempt in range(3):
+            ev = tempfile.mkdtemp(prefix="flocigo-lane-")
+            res = run_ticket(iss["number"], iss["title"], iss.get("body") or "", ev)
+            if res.get("outcome") == "published": break
+            if res.get("outcome") in ("transport_uncertain", "invalid_payload"):
+                print(f"retry {attempt+1}/3 after {res.get('outcome')}", flush=True); continue
+            break
+        print(json.dumps(res, indent=2))
+    elif sys.argv[1] == "all":
+        raw = subprocess.check_output(["gh", "issue", "list", "--repo", REPO, "--state", "open", "--json", "number,title,body", "--limit", "60"], text=True)
+        issues = sorted(json.loads(raw), key=lambda i: i["number"])
+        prlist = json.loads(subprocess.check_output(["gh", "pr", "list", "--repo", REPO, "--state", "open", "--json", "number,title"], text=True))
+        pr_ticket_by_num = set()
+        for pr in prlist:
+            t = pr["title"]
+            if t.startswith("Ticket ") and ":" in t:
+                try: pr_ticket_by_num.add(int(t.split(" ")[1].strip()))
+                except ValueError: pass
+        for iss in issues:
+            n = iss["number"]
+            if n in pr_ticket_by_num:
+                print(f"SKIP #{n}: pr already open", flush=True); continue
+            for attempt in range(3):
+                ev = tempfile.mkdtemp(prefix="flocigo-lane-")
+                try:
+                    res = run_ticket(n, iss["title"], iss.get("body") or "", ev)
+                except Exception as e:
+                    print(f"ERR #{n}: {str(e)[:80]}", flush=True); break
+                if res.get("outcome") == "published": break
+                if res.get("outcome") in ("transport_uncertain", "invalid_payload"):
+                    print(f"retry {attempt+1}/3 #{n} after {res.get('outcome')}", flush=True); continue
+                break
+            subprocess.run(["git", "checkout", "main"], cwd=ROOT, capture_output=True)
+            time.sleep(3)
+        print("FACTORY_ALL_COMPLETE", flush=True)
