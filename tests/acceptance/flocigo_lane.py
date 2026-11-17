@@ -15,6 +15,7 @@ def mem_record(ticket, kind, key, detail):
 
 def run_ticket(num, title, body, ev_dir):
     p = pathlib.Path(ev_dir); p.mkdir(parents=True, mode=0o700, exist_ok=True)
+    (p / 'gocache').mkdir(mode=0o700, exist_ok=True)
     print(f"TICKET #{num} {title}", flush=True)
     prompt = body + "\n\nImplement as Go inside floci-go. Output ONLY JSON: {\"files\":[{\"path\":\"src.go\",\"content\":\"...\"}],\"summary\":\"...\"}. Tests must pass."
     req = json.dumps({"model": "glm-5.3-flash:cloud", "messages": [{"role": "user", "content": prompt}], "stream": False})
@@ -59,14 +60,14 @@ def run_ticket(num, title, body, ev_dir):
              subprocess.check_output(["docker", "image", "inspect", img, "--format", "{{.Id}}"], text=True).strip(),
              "test", "-count=1", "-timeout=60s", "./..."]
     try:
-        subprocess.check_output(cargs, text=True, stderr=subprocess.DEVNULL)
+        subprocess.check_output(cargs, text=True)
         cid = subprocess.check_output(["docker", "container", "inspect", "--format", "{{.Id}}", name], text=True).strip()
         subprocess.run(["docker", "container", "start", cid], capture_output=True, timeout=120)
         exit_code = subprocess.check_output(["docker", "container", "inspect", "--format", "{{.State.ExitCode}}", cid], text=True).strip()
         subprocess.run(["docker", "container", "rm", "-f", cid], capture_output=True, timeout=30)
     except Exception as e:
         return {"outcome": "worker_uncertain", "detail": str(e)[:100]}
-    (p / "terminal-proof.json").write_text(json.dumps({"container": cname, "exit_code": int(exit_code), "result": "pass" if exit_code == "0" else "fail"}))
+    (p / "terminal-proof.json").write_text(json.dumps({"container": name, "exit_code": int(exit_code), "result": "pass" if exit_code == "0" else "fail"}))
     if exit_code != "0":
         (p / "model-result.json").write_text(json.dumps({"outcome": "worker_fail", "exit_code": int(exit_code)}))
         return {"outcome": "worker_fail"}
