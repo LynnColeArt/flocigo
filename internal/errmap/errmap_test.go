@@ -41,7 +41,7 @@ func TestS3NoSuchKeyWireShape(t *testing.T) {
 }
 
 func TestS3NoSuchBucketContextOrder(t *testing.T) {
-    out := S3(New("NoSuchBucket", ""), "req-4", "host-4").With("BucketName", "old-bucket")
+    out := S3(New("NoSuchBucket", "").With("BucketName", "old-bucket"), "req-4", "host-4")
 
     want := s3XMLDecl +
         `<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>` +
@@ -71,7 +71,7 @@ func TestS3AccessDeniedContextOrder(t *testing.T) {
 
 func TestS3XMLEscaping(t *testing.T) {
     out := S3(New("InvalidRequest", `a<b> & c & "d"`), "r", "h")
-    if !strings.Contains(string(out.Body), `<Message>a&lt;b&gt; &amp; c & "d"</Message>`) {
+    if !strings.Contains(string(out.Body), `<Message>a&lt;b&gt; &amp; c &amp; "d"</Message>`) {
         t.Fatalf("body = %s", out.Body)
     }
 }
@@ -345,7 +345,7 @@ func TestCatalogFamilyCoverage(t *testing.T) {
             t.Errorf("%q not exposed by the S3 family", c)
         }
     }
-    for _, c := range []string{"ConditionalCheckFailedException", "ValidationException", "ResourceNotFoundException", "ThrottlingException", "ProvisionedThroughputExceededException", "InternalServerError", "AccessDenied"} {
+    for _, c := range []string{"ConditionalCheckFailedException", "ValidationException", "ResourceNotFoundException", "ThrottlingException", "ProvisionedThroughputExceededException", "InternalError", "AccessDenied"} {
         d, ok := Lookup(c)
         if !ok {
             t.Fatalf("missing canonical code %q", c)

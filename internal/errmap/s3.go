@@ -38,6 +38,7 @@ func S3(err error, reqID, hostID string) Out {
     b.WriteString(xmlText(name))
     b.WriteString("</Code><Message>")
     b.WriteString(xmlText(msg))
+    b.WriteString("</Message>")
     for _, k := range s3CtxOrder {
         if v, ok := e.Ctx[k]; ok {
             b.WriteString("<" + k + ">")
