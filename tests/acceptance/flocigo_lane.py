@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Factory lane for flocigo tickets. Reads open issues, runs model→edit→worker→publish per ticket, unsupervised."""
-import json, os, pathlib, subprocess, sys, tempfile, time, hashlib
+import json, os, pathlib, re, subprocess, sys, tempfile, time, hashlib
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 REPO = "LynnColeArt/flocigo"
 AUTH = pathlib.Path(os.environ.get("FLEET_FACTORY_STATE", os.path.expanduser("~/.local/state/agent-fleet"))) / "authority"
@@ -134,9 +134,8 @@ if __name__ == "__main__":
         pr_ticket_by_num = set()
         for pr in prlist:
             t = pr["title"]
-            if t.startswith("Ticket ") and ":" in t:
-                try: pr_ticket_by_num.add(int(t.split(" ")[1].strip()))
-                except ValueError: pass
+            m = re.match(r"Ticket\s+(\d+)", t)
+            if m: pr_ticket_by_num.add(int(m.group(1)))
         for iss in issues:
             n = iss["number"]
             if n in pr_ticket_by_num:
