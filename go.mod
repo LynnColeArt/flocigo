@@ -1,3 +1,3 @@
-module github.com/LynnColeArt/flocigo
+module floci-go
 
-go 1.26
+go 1.18
