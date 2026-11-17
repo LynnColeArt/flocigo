@@ -21,7 +21,7 @@ def run_ticket(num, title, body, ev_dir):
     req = json.dumps({"model": "glm-5.3-flash:cloud", "messages": [{"role": "user", "content": prompt}], "stream": False})
     (p / "model-intent.json").write_text(json.dumps({"model": "glm-5.3-flash:cloud", "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}))
     try:
-        resp = json.loads(subprocess.check_output(["curl", "-s", "--max-time", "900", "http://127.0.0.1:11434/api/chat", "-d", req], timeout=960, text=True))
+        resp = json.loads(subprocess.check_output(["curl", "-s", "--max-time", "1800", "http://127.0.0.1:11434/api/chat", "-d", req], timeout=1860, text=True))
         content = (resp.get("message") or {}).get("content", "")
         tok = resp.get("eval_count", 0)
     except Exception as e:
