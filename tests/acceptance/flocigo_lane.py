@@ -86,9 +86,13 @@ def run_ticket(num, title, body, ev_dir):
     if exit_code != "0":
         (p / "model-result.json").write_text(json.dumps({"outcome": "worker_fail", "exit_code": int(exit_code)}))
         return {"outcome": "worker_fail"}
-    # host compile check + commit + push + PR
-    subprocess.run(["go", "build", "./..."], cwd=ROOT, env={**os.environ, "GOPROXY": "off"}, capture_output=True, timeout=60)
-    subprocess.run(["go", "test", "./..."], cwd=ROOT, env={**os.environ, "GOPROXY": "off"}, capture_output=True, timeout=120)
+    # host compile check + commit + push + PR (only on host build+test success)
+    hb = subprocess.run(["go", "build", "./..."], cwd=ROOT, env={**os.environ, "GOPROXY": "off"}, capture_output=True, timeout=60)
+    ht = subprocess.run(["go", "test", "./..."], cwd=ROOT, env={**os.environ, "GOPROXY": "off"}, capture_output=True, timeout=120)
+    if hb.returncode != 0 or ht.returncode != 0:
+        detail = (hb.stderr.decode() or "").strip()[:200] or (ht.stdout.decode() or "").strip()[:200]
+        (p / "model-result.json").write_text(json.dumps({"outcome": "host_test_fail", "detail": detail}))
+        return {"outcome": "host_test_fail"}
     branch = f"flocigo/ticket-{num:03d}"
     base = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ROOT, text=True).strip()
     subprocess.run(["git", "checkout", "-b", branch], cwd=ROOT, capture_output=True, timeout=15)
