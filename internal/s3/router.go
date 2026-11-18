@@ -1,161 +1,309 @@
+// Package s3 implements a floci-compatible subset of the Amazon S3 REST API.
+// router.go owns the single http.Handler entry point for the service and
+// dispatches every request to the per-operation handlers in this package.
 package s3
 
 import (
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
-	"net"
-	"net/http"
-	"strings"
-	"time"
+    "bytes"
+    "crypto/md5"
+    "encoding/hex"
+    "encoding/xml"
+    "io"
+    "net/http"
+    "net/url"
+    "strconv"
+    "strings"
 )
 
-// Router serves the S3 HTTP surface over one Store. It understands both
-// path-style (http://host/bucket/key) and virtual-hosted-style
-// (http://bucket.s3.<host>/key) addressing.
-type Router struct {
-	// Store backs every bucket and object; lazily created when nil.
-	Store *Store
-	// Region is reported by GetBucketLocation (default us-east-1).
-	Region string
-	// Presign plugs in credential resolution and signed-request notification.
-	Presign *PresignHooks
+// wireXMLNS is the XML namespace used by S3 response documents.
+const wireXMLNS = `http://s3.amazonaws.com/doc/2006-03-01/`
+
+// wireMethodNotAllowedMessage mirrors the AWS wording for 405 responses.
+const wireMethodNotAllowedMessage = `The specified method is not allowed against this resource.`
+
+// Handler returns the root http.Handler for the S3 service.
+func Handler() http.Handler {
+    return http.HandlerFunc(route)
 }
 
-// Service is an alias kept for uniform service wiring across the emulator.
-type Service = Router
+// NewHandler is an alias of Handler.
+func NewHandler() http.Handler { return Handler() }
 
-// New returns a Router over an optional store.
-func New(store ...*Store) *Router { return newRouter(store) }
+// NewRouter is an alias of Handler.
+func NewRouter() http.Handler { return Handler() }
 
-// NewRouter is a synonym for New.
-func NewRouter(store ...*Store) *Router { return newRouter(store) }
+// New is an alias of Handler.
+func New() http.Handler { return Handler() }
 
-// NewHandler is a synonym for New.
-func NewHandler(store ...*Store) *Router { return newRouter(store) }
+// Service exposes the S3 API surface as a mountable http.Handler.
+type Service struct{}
 
-// NewServer is a synonym for New.
-func NewServer(store ...*Store) *Router { return newRouter(store) }
+// NewService builds the S3 service.
+func NewService() *Service { return &Service{} }
 
-// NewService is a synonym for New.
-func NewService(store ...*Store) *Router { return newRouter(store) }
-
-func newRouter(store []*Store) *Router {
-	rt := &Router{}
-	if len(store) > 0 && store[0] != nil {
-		rt.Store = store[0]
-	}
-	return rt
-}
-
-// Handler returns rt as an http.Handler.
-func (rt *Router) Handler() http.Handler { return rt }
-
-func (rt *Router) store() *Store {
-	if rt.Store == nil {
-		rt.Store = NewStore()
-	}
-	return rt.Store
-}
-
-func (rt *Router) region() string {
-	if rt.Region == "" {
-		return DefaultRegion
-	}
-	return rt.Region
-}
-
-// splitTarget resolves the bucket/key pair for a request, honoring
-// virtual-host style Host headers before falling back to path style.
-func splitTarget(host, path string) (bucket, key string, hostStyle bool) {
-	h := host
-	if hh, _, err := net.SplitHostPort(h); err == nil {
-		h = hh
-	}
-	h = strings.ToLower(strings.Trim(h, "[]"))
-	if i := strings.Index(h, ".s3."); i > 0 && len(h[i+4:]) > 0 {
-		return h[:i], strings.TrimPrefix(path, "/"), true
-	}
-	if rest, ok := strings.CutSuffix(h, ".localhost"); ok && rest != "" && rest != "s3" {
-		return rest, strings.TrimPrefix(path, "/"), true
-	}
-	rest := strings.TrimPrefix(path, "/")
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		return rest[:i], rest[i+1:], false
-	}
-	return rest, "", false
-}
+// Handler returns the http.Handler exposed by the S3 service.
+func (Service) Handler() http.Handler { return Handler() }
 
 // ServeHTTP implements http.Handler.
-func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	reqID := newRequestID()
-	h := w.Header()
-	h.Set("Server", "AmazonS3")
-	h.Set("Date", time.Now().UTC().Format(http.TimeFormat))
-	h.Set("x-amz-request-id", reqID)
-	h.Set("x-amz-id-2", newTraceID())
+func (Service) ServeHTTP(w http.ResponseWriter, r *http.Request) { route(w, r) }
 
-	bucket, _, hostStyle := splitTarget(r.Host, r.URL.Path)
-	if e := rt.authorize(r, bucket, hostStyle); e != nil {
-		writeError(w, r, e)
-		return
-	}
-	_, key, _ := splitTarget(r.Host, r.URL.Path)
-	c := &reqCtx{rt: rt, w: w, r: r, bucket: bucket, key: key, hostStyle: hostStyle}
-	c.dispatch()
+// wireError is an error rendered inside the common S3 <Error> envelope.
+type wireError struct {
+    Status  int
+    Code    string
+    Message string
+    Extra   string
 }
 
-// reqCtx carries one request through the operation dispatch.
-type reqCtx struct {
-	rt        *Router
-	w         http.ResponseWriter
-	r         *http.Request
-	bucket    string
-	key       string
-	hostStyle bool
+func (e *wireError) Error() string { return e.Code + ": " + e.Message }
+
+// route dispatches an S3 request to the operation handler matching its
+// method and bucket/key path.
+func route(w http.ResponseWriter, r *http.Request) {
+    bucket, key := splitS3Path(r.URL.Path)
+    q := r.URL.Query()
+    switch r.Method {
+    case http.MethodGet:
+        wireDispatchGet(w, r, bucket, key, q)
+    case http.MethodHead:
+        wireDispatchHead(w, r, bucket, key)
+    case http.MethodPut:
+        wireDispatchPut(w, r, bucket, key, q)
+    case http.MethodPost:
+        wireDispatchPost(w, r, bucket, key, q)
+    case http.MethodDelete:
+        wireDispatchDelete(w, r, bucket, key, q)
+    default:
+        writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+    }
 }
 
-func (c *reqCtx) dispatch() {
-	switch {
-	case c.bucket == "":
-		c.rootOperation()
-	case c.key == "":
-		c.bucketLevel()
-	default:
-		c.objectLevel()
-	}
+// dispatch is an alias of route.
+func dispatch(w http.ResponseWriter, r *http.Request) { route(w, r) }
+
+// serveS3 is an alias of route.
+func serveS3(w http.ResponseWriter, r *http.Request) { route(w, r) }
+
+// wireDispatchGet routes GET /, GET /{bucket} and GET /{bucket}/{key}.
+func wireDispatchGet(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+    switch {
+    case bucket == "":
+        wireListBuckets(w, r)
+    case key == "":
+        switch {
+        case q.Has("location"):
+            wireBucketLocation(w, r, bucket)
+        case q.Has("versioning"):
+            wireRawXML(w, http.StatusOK, `<VersioningConfiguration xmlns="`+wireXMLNS+`"/>`)
+        case q.Has("policy"):
+            writeWireError(w, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist", "<BucketName>"+xmlEscapeWire(bucket)+"</BucketName>")
+        case q.Has("cors"):
+            writeWireError(w, http.StatusNotFound, "NoSuchCORSConfiguration", "The CORS configuration does not exist", "<BucketName>"+xmlEscapeWire(bucket)+"</BucketName>")
+        case q.Has("acl"):
+            wireAccessControlPolicy(w)
+        case q.Has("tagging"):
+            writeWireError(w, http.StatusNotFound, "NoSuchTagSet", "The TagSet does not exist", "<BucketName>"+xmlEscapeWire(bucket)+"</BucketName>")
+        case q.Has("uploads"):
+            wireListMultipartUploads(w, r, bucket)
+        default:
+            wireListObjects(w, r, bucket)
+        }
+    default:
+        switch {
+        case q.Has("tagging"):
+            wireRawXML(w, http.StatusOK, `<Tagging xmlns="`+wireXMLNS+`"><TagSet></TagSet></Tagging>`)
+        case q.Has("acl"):
+            wireAccessControlPolicy(w)
+        case q.Has("uploadId"):
+            wireListParts(w, r, bucket, key, q.Get("uploadId"))
+        default:
+            handleGetObject(w, r)
+        }
+    }
 }
 
-func (c *reqCtx) rootOperation() {
-	switch c.r.Method {
-	case http.MethodGet:
-		c.listBuckets()
-	case http.MethodHead:
-		writeEmpty(c.w, http.StatusOK)
-	default:
-		c.default405()
-	}
+// wireDispatchHead routes HEAD /, HEAD /{bucket} and HEAD /{bucket}/{key}.
+func wireDispatchHead(w http.ResponseWriter, r *http.Request, bucket, key string) {
+    switch {
+    case bucket == "":
+        w.WriteHeader(http.StatusOK)
+    case key == "":
+        wireHeadBucket(w, r, bucket)
+    default:
+        handleHeadObject(w, r)
+    }
 }
 
-func (c *reqCtx) mustBucket() *s3Error {
-	if _, ok := c.rt.store().GetBucket(c.bucket); !ok {
-		return errNoSuchBucket()
-	}
-	return nil
+// wireDispatchPut routes PUT /{bucket} and PUT /{bucket}/{key}.
+func wireDispatchPut(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+    switch {
+    case bucket == "":
+        writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+    case key == "":
+        if len(q) > 0 {
+            w.WriteHeader(http.StatusOK)
+            return
+        }
+        wireCreateBucket(w, r, bucket)
+    default:
+        switch {
+        case q.Has("partNumber"):
+            wireUploadPart(w, r, bucket, key, q.Get("partNumber"), q.Get("uploadId"))
+        case r.Header.Get("X-Amz-Copy-Source") != "":
+            wireCopyObject(w, r, bucket, key)
+        case len(q) > 0:
+            w.WriteHeader(http.StatusOK)
+        default:
+            wirePutObject(w, r, bucket, key)
+        }
+    }
 }
 
-func (c *reqCtx) default405() {
-	writeError(c.w, c.r, s3err(405, "MethodNotAllowed", "The specified method is not allowed against this resource."))
+// wireDispatchPost routes POST /{bucket} and POST /{bucket}/{key}.
+func wireDispatchPost(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+    switch {
+    case bucket == "":
+        writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+    case key == "":
+        if q.Has("delete") {
+            wireDeleteObjects(w, r, bucket)
+            return
+        }
+        writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+    default:
+        switch {
+        case q.Has("uploads"):
+            wireCreateMultipartUpload(w, r, bucket, key)
+        case q.Has("uploadId"):
+            wireCompleteMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
+        default:
+            writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+        }
+    }
 }
 
-func newRequestID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return strings.ToUpper(hex.EncodeToString(b))
+// wireDispatchDelete routes DELETE /{bucket} and DELETE /{bucket}/{key}.
+func wireDispatchDelete(w http.ResponseWriter, r *http.Request, bucket, key string, q url.Values) {
+    switch {
+    case bucket == "":
+        writeWireError(w, http.StatusMethodNotAllowed, "MethodNotAllowed", wireMethodNotAllowedMessage, "")
+    case key == "":
+        if len(q) > 0 {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        wireDeleteBucket(w, r, bucket)
+    default:
+        if q.Has("uploadId") {
+            wireAbortMultipartUpload(w, r, bucket, key, q.Get("uploadId"))
+            return
+        }
+        wireDeleteObject(w, r, bucket, key)
+    }
 }
 
-func newTraceID() string {
-	b := make([]byte, 24)
-	_, _ = rand.Read(b)
-	return base64.StdEncoding.EncodeToString(b)
+// wireHeadBucket answers HEAD /{bucket} with 200 or 404.
+func wireHeadBucket(w http.ResponseWriter, r *http.Request, bucket string) {
+    if wires.lookupBucket(bucket) == nil {
+        wireNoSuchBucket(w, bucket)
+        return
+    }
+    w.WriteHeader(http.StatusOK)
+}
+
+// wireBucketLocation answers GET /{bucket}?location.
+func wireBucketLocation(w http.ResponseWriter, r *http.Request, bucket string) {
+    if wires.lookupBucket(bucket) == nil {
+        wireNoSuchBucket(w, bucket)
+        return
+    }
+    wireRawXML(w, http.StatusOK, `<LocationConstraint xmlns="`+wireXMLNS+`"/>`)
+}
+
+// wireAccessControlPolicy answers GET ?acl with the canned owner ACL.
+func wireAccessControlPolicy(w http.ResponseWriter) {
+    wireRawXML(w, http.StatusOK, `<AccessControlPolicy xmlns="`+wireXMLNS+`"><Owner><ID>floci</ID><DisplayName>floci</DisplayName></Owner><AccessControlList><Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser"><ID>floci</ID><DisplayName>floci</DisplayName></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>`)
+}
+
+// wireReadBody reads the full request body, tolerating read errors for the
+// purposes of the emulator.
+func wireReadBody(r *http.Request) []byte {
+    body, err := io.ReadAll(r.Body)
+    if err != nil {
+        return nil
+    }
+    return body
+}
+
+// splitS3Path splits an S3-style path into bucket and key. The first path
+// segment is the bucket; everything after it forms the key, slashes included.
+func splitS3Path(path string) (string, string) {
+    trimmed := strings.TrimPrefix(path, "/")
+    if trimmed == "" {
+        return "", ""
+    }
+    if i := strings.Index(trimmed, "/"); i >= 0 {
+        return trimmed[:i], trimmed[i+1:]
+    }
+    return trimmed, ""
+}
+
+var wireXMLEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+
+// xmlEscapeWire escapes plain text for hand-built XML documents.
+func xmlEscapeWire(s string) string {
+    return wireXMLEscaper.Replace(s)
+}
+
+// wireETag returns the unquoted hex MD5 of body.
+func wireETag(body []byte) string {
+    sum := md5.Sum(body)
+    return hex.EncodeToString(sum[:])
+}
+
+// wireQuotedETag renders an ETag the way S3 sends it, quoted.
+func wireQuotedETag(etag string) string {
+    return `"` + etag + `"`
+}
+
+// writeWireError renders an S3 error as the standard XML <Error> envelope.
+func writeWireError(w http.ResponseWriter, status int, code, message, extra string) {
+    body := xml.Header + "<Error><Code>" + xmlEscapeWire(code) + "</Code><Message>" + xmlEscapeWire(message) + "</Message>"
+    if extra != "" {
+        body += extra
+    }
+    body += "</Error>"
+    w.Header().Set("Content-Type", "application/xml")
+    w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+    w.WriteHeader(status)
+    _, _ = w.Write([]byte(body))
+}
+
+// wireXMLDoc renders a marshaled XML document as a full S3 response.
+func wireXMLDoc(w http.ResponseWriter, status int, doc interface{}) {
+    raw, err := xml.Marshal(doc)
+    if err != nil {
+        writeWireError(w, http.StatusInternalServerError, "InternalError", "We encountered an internal error. Please try again.", "")
+        return
+    }
+    // Go escapes double quotes and control characters inside element text;
+    // S3 serves quoted ETags and raw key text, so undo those escapes.
+    raw = bytes.ReplaceAll(raw, []byte("&quot;"), []byte("\""))
+    raw = bytes.ReplaceAll(raw, []byte("&#xA;"), []byte("\n"))
+    raw = bytes.ReplaceAll(raw, []byte("&#x9;"), []byte("\t"))
+    raw = bytes.ReplaceAll(raw, []byte("&#xD;"), []byte("\r"))
+    body := append([]byte(xml.Header), raw...)
+    w.Header().Set("Content-Type", "application/xml")
+    w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+    w.WriteHeader(status)
+    _, _ = w.Write(body)
+}
+
+// wireRawXML renders a pre-built XML document as a full S3 response.
+func wireRawXML(w http.ResponseWriter, status int, doc string) {
+    body := xml.Header + doc
+    w.Header().Set("Content-Type", "application/xml")
+    w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+    w.WriteHeader(status)
+    _, _ = w.Write([]byte(body))
 }
