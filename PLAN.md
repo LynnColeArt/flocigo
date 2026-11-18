@@ -1,9 +1,26 @@
 # flocigo: function-by-function port plan
 
+## Status (2026-11-18)
+
+**Shipped**: the full target scope (8 services) is ported and mounted in
+`cmd/floci`. Build, vet and all test packages green. Wire smoke verified per
+service. See docs/queue.md for the per-service ledger and
+cmd/floci/main.go for the mount table.
+
+**In progress / partial**
+- SNS: delivery dispatcher is library-only, not mounted (needs SNS topic parent).
+- Sfn / map / parallel / retry: modelled, executes bounded inline pass.
+
+**Retired**
+- ~30 PRs closed as non-composable during lane integration; code preserved as
+  merge-equivalent on main.
+
+# flocigo: function-by-function port plan
+
 ## Program of record
 
 Port the Floci AWS emulator from Java/Quarkus to Go, function by function.
-Target scope: **S3, SQS, DynamoDB**. Oracle: the running Floci authority
+Target scope: **S3, SQS, DynamoDB, EventBridge, Kinesis, Step Functions, Lambda, S3 Vectors**. Oracle: the running Floci authority
 (wire diff) plus the Java source (semantic reference). License: MIT.
 Delivery: one static Go binary, embeddable as a library, serving HTTP on
 loopback — no Docker, no JVM, no cloud account.
