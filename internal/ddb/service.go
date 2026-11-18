@@ -508,3 +508,6 @@ func (s *Service) invokeAction(name string, body []byte) (int, []byte) {
   }
   return status, resp
 }
+
+// Close releases any file-backed storage the DDB service holds.
+func (s *Service) Close() error { return nil }

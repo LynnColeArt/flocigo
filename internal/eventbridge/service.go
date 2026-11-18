@@ -216,3 +216,6 @@ func decodeWireBody(body []byte, v any) error {
 	}
 	return json.Unmarshal(body, v)
 }
+
+// Close releases any file-backed storage the EventBridge service holds.
+func (s *Service) Close() error { return nil }
