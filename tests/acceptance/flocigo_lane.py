@@ -17,7 +17,22 @@ def run_ticket(num, title, body, ev_dir):
     p = pathlib.Path(ev_dir); p.mkdir(parents=True, mode=0o700, exist_ok=True)
     (p / 'gocache').mkdir(mode=0o700, exist_ok=True)
     print(f"TICKET #{num} {title}", flush=True)
-    prompt = body + "\n\nImplement as Go inside floci-go. Output ONLY JSON: {\"files\":[{\"path\":\"src.go\",\"content\":\"...\"}],\"summary\":\"...\"}. Tests must pass."
+    # Repo layout for the model to respect - captured at lane start so the
+    # model sees exactly what a proper PR diff should look like.
+    try:
+        tree = subprocess.check_output(["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only", "HEAD"], text=True)
+    except Exception:
+        tree = "(unavailable)"
+    LAYOUT = (
+        "\n\n---\n"
+        "Repository: github.com/LynnColeArt/flocigo (module flocigo, Go 1.26).\n"
+        "Place your implementation inside internal/<service>/ (or dynamodb/ or partiql/ or sfn/) with the package name matching the directory.\n"
+        "Do NOT put code in a repo-root src.go. Do NOT rewrite go.mod. Keep the module as github.com/LynnColeArt/flocigo.\n"
+        "Wire any Service into a single http.Handler if it is an HTTP surface; the root binary cmd/floci/main.go may be updated to mount it.\n"
+        "Current repo file list:\n" + tree.strip() + "\n"
+        "---\n"
+    )
+    prompt = body + LAYOUT + "\n\nImplement as Go inside floci-go. Output ONLY JSON: {\"files\":[{\"path\":\"internal/<service>/<op>.go\",\"content\":\"...\"}],\"summary\":\"...\"}. Tests must pass."
     req = json.dumps({"model": "glm-5.3-flash:cloud", "messages": [{"role": "user", "content": prompt}], "stream": False})
     (p / "model-intent.json").write_text(json.dumps({"model": "glm-5.3-flash:cloud", "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest()}))
     try:
