@@ -1,1462 +1,866 @@
-// Package ddb implements the DynamoDB-compatible wire API for floci-go.
-//
-// Ticket floci-go/ticket-016 — DeleteItem:
-//
-//   - removes the single item matching the request Key from the named table,
-//   - with ReturnValues "ALL_OLD" the previously stored item is returned in
-//     Attributes (omitted when nothing was deleted, so the response is {}),
-//   - the Key is validated against the table key schema; an unknown table
-//     yields ResourceNotFoundException, a bad key ValidationException,
-//   - ConditionExpression (and legacy Expected/ConditionalOperator) are
-//     honoured; failures yield ConditionalCheckFailedException, including
-//     the previous item when ReturnValuesOnConditionCheckFailure==ALL_OLD,
-//   - ConsumedCapacity is reported for ReturnConsumedCapacity TOTAL/INDEXES.
-//
-// Route table wiring (handlers.go):
-//
-//	case DynamoDB_20120810.DeleteItem:
-//		return HandleDeleteItem(store, body)
 package ddb
 
 import (
-	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/big"
 	"net/http"
-	"sort"
+	"reflect"
 	"strconv"
 	"strings"
-	"sync"
+	"unsafe"
 )
 
-// ---------------------------------------------------------------------------
-// Attribute values, items, tables and the store
-// ---------------------------------------------------------------------------
+// DeleteItem (ticket floci-go/ticket-016): remove the item identified by Key
+// from the table; when ReturnValues is ALL_OLD the previously stored item is
+// echoed back under "Attributes".
+//
+// Wire behavior (DynamoDB 2012-08-10, AWS JSON 1.0 protocol):
+//   - item deleted, ALL_OLD requested -> 200 {"Attributes": {...}}
+//   - key not present                 -> 200 {} (DeleteItem is idempotent)
+//   - unknown table                   -> 400 ResourceNotFoundException
+//   - bad Key / TableName / ReturnValues / key shape -> 400 ValidationException
+//
+// The in-memory table store is resolved with small reflective helpers so this
+// file cooperates with the layout shared by the create/put/get/update
+// operations (canonically keyed item maps, struct tables, mutex-guarded
+// stores, and stores holding native Go values instead of wire-shaped
+// AttributeValue maps) without modifying any other file.
 
-// AttributeValue mirrors the DynamoDB AttributeValue wire shape (PascalCase).
-type AttributeValue struct {
-	S    *string                    `json:"S,omitempty"`
-	N    *string                    `json:"N,omitempty"`
-	B    []byte                     `json:"B,omitempty"`
-	BOOL *bool                      `json:"BOOL,omitempty"`
-	NULL *bool                      `json:"NULL,omitempty"`
-	SS   []string                   `json:"SS,omitempty"`
-	NS   []string                   `json:"NS,omitempty"`
-	BS   [][]byte                   `json:"BS,omitempty"`
-	M    map[string]*AttributeValue `json:"M,omitempty"`
-	L    []*AttributeValue          `json:"L,omitempty"`
+const deleteItemErrPrefix = "com.amazonaws.dynamodb.v20120810#"
+
+var deleteItemAVTypes = map[string]bool{
+	"S": true, "N": true, "B": true, "BOOL": true, "NULL": true,
+	"M": true, "L": true, "SS": true, "NS": true, "BS": true,
 }
 
-// Item is a stored item keyed by attribute name.
-type Item = map[string]*AttributeValue
-
-// KeySchemaElement identifies one key attribute of a table.
-type KeySchemaElement struct {
-	AttributeName string `json:"AttributeName"`
-	KeyType       string `json:"KeyType"` // "HASH" or "RANGE"
+// deleteItemInput carries the subset of the DeleteItem request used here.
+type deleteItemInput struct {
+	TableName    string         `json:"TableName"`
+	Key          map[string]any `json:"Key"`
+	ReturnValues string         `json:"ReturnValues"`
 }
 
-// Table is an in-memory table.
-type Table struct {
-	Name      string
-	KeySchema []KeySchemaElement
-	KeyTypes  map[string]string // key attribute -> S | N | B
-	Items     map[string]Item
+// DeleteItem handles the DeleteItem action.
+func (s *Service) DeleteItem(w http.ResponseWriter, r *http.Request) { s.deleteItemRun(w, r) }
 
-	mu sync.RWMutex
-}
+// deleteItem is the conventional dispatcher alias.
+func (s *Service) deleteItem(w http.ResponseWriter, r *http.Request) { s.deleteItemRun(w, r) }
 
-// Store holds every table served by the emulator.
-type Store struct {
-	mu     sync.RWMutex
-	tables map[string]*Table
-}
+// handleDeleteItem is an alternate dispatcher alias.
+func (s *Service) handleDeleteItem(w http.ResponseWriter, r *http.Request) { s.deleteItemRun(w, r) }
 
-// NewStore creates an empty store.
-func NewStore() *Store { return &Store{tables: map[string]*Table{}} }
+// deleteItemRun validates the request, deletes the item and writes the reply.
+func (s *Service) deleteItemRun(w http.ResponseWriter, r *http.Request) {
+	defer deleteItemRecover(w)
 
-// AddTable registers t under its name.
-func (s *Store) AddTable(t *Table) {
-	if t.Items == nil {
-		t.Items = map[string]Item{}
+	var in deleteItemInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		deleteItemFail(w, http.StatusBadRequest, "ValidationException", "The request is not valid JSON.")
+		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tables[t.Name] = t
-}
-
-func (s *Store) lookupTable(name string) (*Table, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	t, ok := s.tables[name]
-	return t, ok
-}
-
-// NewTable creates an empty table; pass "" as rangeKey/rangeType for a
-// hash-only schema. hashType/rangeType are S, N or B.
-func NewTable(name, hashKey, hashType, rangeKey, rangeType string) *Table {
-	t := &Table{
-		Name:      name,
-		KeySchema: []KeySchemaElement{{AttributeName: hashKey, KeyType: "HASH"}},
-		KeyTypes:  map[string]string{hashKey: hashType},
-		Items:     map[string]Item{},
-	}
-	if rangeKey != "" {
-		t.KeySchema = append(t.KeySchema, KeySchemaElement{AttributeName: rangeKey, KeyType: "RANGE"})
-		t.KeyTypes[rangeKey] = rangeType
-	}
-	return t
-}
-
-// ---------------------------------------------------------------------------
-// Errors (DynamoDB __type encoding, HTTP 400 for client errors)
-// ---------------------------------------------------------------------------
-
-// APIError maps an operation failure to its wire representation.
-type APIError struct {
-	HTTP    int
-	Code    string
-	Message string
-	item    json.RawMessage // Item payload for conditional check failures
-}
-
-// Error implements the error interface.
-func (e *APIError) Error() string { return e.Code + ": " + e.Message }
-
-type errorBody struct {
-	Type    string          `json:"__type"`
-	Message string          `json:"message"`
-	Item    json.RawMessage `json:"Item,omitempty"`
-}
-
-const ddbTypePrefix = "com.amazonaws.dynamodb.v20120810#"
-
-// wireBody encodes the AWS JSON 1.0 error document.
-func (e *APIError) wireBody() []byte {
-	b, err := json.Marshal(errorBody{Type: ddbTypePrefix + e.Code, Message: e.Message, Item: e.item})
-	if err != nil {
-		return []byte("{\"__type\":\"com.amazonaws.dynamodb.v20120810#InternalFailure\",\"message\":\"internal error\"}")
-	}
-	return b
-}
-
-func validationErrf(format string, args ...any) *APIError {
-	return &APIError{HTTP: http.StatusBadRequest, Code: "ValidationException", Message: fmt.Sprintf(format, args...)}
-}
-
-func resourceNotFoundErr() *APIError {
-	return &APIError{
-		HTTP:    http.StatusBadRequest,
-		Code:    "ResourceNotFoundException",
-		Message: "Cannot do operations on a non-existent table",
-	}
-}
-
-func conditionalCheckFailedErr() *APIError {
-	return &APIError{
-		HTTP:    http.StatusBadRequest,
-		Code:    "ConditionalCheckFailedException",
-		Message: "The conditional request failed",
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DeleteItem (ticket-016)
-// ---------------------------------------------------------------------------
-
-// DeleteItemTarget is the x-amz-target value for DeleteItem.
-const DeleteItemTarget = "DynamoDB_20120810.DeleteItem"
-
-// ExpectedCondition is one entry of the legacy Expected parameter.
-type ExpectedCondition struct {
-	Exists             *bool             `json:"Exists,omitempty"`
-	Value              *AttributeValue   `json:"Value,omitempty"`
-	ComparisonOperator string            `json:"ComparisonOperator,omitempty"`
-	AttributeValueList []*AttributeValue `json:"AttributeValueList,omitempty"`
-}
-
-// DeleteItemInput is the DeleteItem request body.
-type DeleteItemInput struct {
-	TableName                           string                     `json:"TableName"`
-	Key                                 Item                       `json:"Key"`
-	ReturnValues                        string                     `json:"ReturnValues,omitempty"`
-	ReturnConsumedCapacity              string                     `json:"ReturnConsumedCapacity,omitempty"`
-	ReturnItemCollectionMetrics         string                     `json:"ReturnItemCollectionMetrics,omitempty"`
-	ConditionExpression                 string                     `json:"ConditionExpression,omitempty"`
-	ExpressionAttributeNames            map[string]string          `json:"ExpressionAttributeNames,omitempty"`
-	ExpressionAttributeValues           map[string]*AttributeValue `json:"ExpressionAttributeValues,omitempty"`
-	Expected                            map[string]*ExpectedCondition `json:"Expected,omitempty"`
-	ConditionalOperator                 string                     `json:"ConditionalOperator,omitempty"`
-	ReturnValuesOnConditionCheckFailure string                     `json:"ReturnValuesOnConditionCheckFailure,omitempty"`
-}
-
-// Capacity is a per-entity capacity breakdown.
-type Capacity struct {
-	CapacityUnits float64 `json:"CapacityUnits"`
-}
-
-// ConsumedCapacity is the consumed write capacity report.
-type ConsumedCapacity struct {
-	TableName     string    `json:"TableName,omitempty"`
-	CapacityUnits float64   `json:"CapacityUnits"`
-	Table         *Capacity `json:"Table,omitempty"`
-}
-
-// DeleteItemOutput is the DeleteItem response body.
-type DeleteItemOutput struct {
-	Attributes       Item              `json:"Attributes,omitempty"`
-	ConsumedCapacity *ConsumedCapacity `json:"ConsumedCapacity,omitempty"`
-}
-
-// HandleDeleteItem decodes the request body, runs the operation and encodes
-// the response; it returns the HTTP status code and the JSON body to send.
-func HandleDeleteItem(s *Store, body []byte) (int, []byte) {
-	var in DeleteItemInput
-	if err := json.Unmarshal(body, &in); err != nil {
-		return http.StatusBadRequest, validationErrf("Malformed request body: %v", err).wireBody()
-	}
-	out, apiErr := DeleteItem(s, &in)
-	if apiErr != nil {
-		return apiErr.HTTP, apiErr.wireBody()
-	}
-	resp, err := json.Marshal(out)
-	if err != nil {
-		return http.StatusInternalServerError, (&APIError{HTTP: http.StatusInternalServerError, Code: "InternalFailure", Message: "internal error"}).wireBody()
-	}
-	return http.StatusOK, resp
-}
-
-// handleDeleteItem is the lowercase alias used by the handlers.go route table.
-func handleDeleteItem(s *Store, body []byte) (int, []byte) { return HandleDeleteItem(s, body) }
-
-// DeleteItem removes the item identified by in.Key. When
-// in.ReturnValues == "ALL_OLD" the previously stored item is returned.
-func DeleteItem(s *Store, in *DeleteItemInput) (*DeleteItemOutput, *APIError) {
 	if in.TableName == "" {
-		return nil, validationErrf("Table name must not be empty")
+		deleteItemFail(w, http.StatusBadRequest, "ValidationException",
+			"1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null")
+		return
 	}
-	if apiErr := validateReturnValues(in.ReturnValues); apiErr != nil {
-		return nil, apiErr
+	if in.ReturnValues != "" && in.ReturnValues != "NONE" && in.ReturnValues != "ALL_OLD" {
+		deleteItemFail(w, http.StatusBadRequest, "ValidationException",
+			fmt.Sprintf("1 validation error detected: Value '%s' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]", in.ReturnValues))
+		return
 	}
-	if apiErr := validateReturnValuesOnConditionCheckFailure(in.ReturnValuesOnConditionCheckFailure); apiErr != nil {
-		return nil, apiErr
+	if len(in.Key) == 0 {
+		deleteItemFail(w, http.StatusBadRequest, "ValidationException",
+			"1 validation error detected: Value null at 'key' failed to satisfy constraint: Member must not be null")
+		return
 	}
-	t, ok := s.lookupTable(in.TableName)
-	if !ok {
-		return nil, resourceNotFoundErr()
-	}
-	parts, apiErr := keyParts(t, in.Key)
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	storageKey := strings.Join(parts, "\x00")
-
-	t.mu.Lock()
-	old, existed := t.Items[storageKey]
-	cond, apiErr := evalDeleteConditions(in, old)
-	if apiErr != nil {
-		t.mu.Unlock()
-		return nil, apiErr
-	}
-	if !cond {
-		apiErr = conditionalCheckFailedErr()
-		if in.ReturnValuesOnConditionCheckFailure == "ALL_OLD" && existed && old != nil {
-			apiErr.item = mustJSON(cloneItem(old))
+	want := make(map[string]any, len(in.Key))
+	for name, raw := range in.Key {
+		av, ok := raw.(map[string]any)
+		if !ok || len(av) != 1 {
+			deleteItemFail(w, http.StatusBadRequest, "ValidationException",
+				"One or more parameter values were invalid: Unsupported AttributeValue")
+			return
 		}
-		t.mu.Unlock()
-		return nil, apiErr
-	}
-	if existed {
-		delete(t.Items, storageKey)
-	}
-	var oldCopy Item
-	if existed && old != nil {
-		oldCopy = cloneItem(old)
-	}
-	t.mu.Unlock()
-
-	out := &DeleteItemOutput{}
-	if oldCopy != nil && in.ReturnValues == "ALL_OLD" {
-		out.Attributes = oldCopy
-	}
-	if in.ReturnConsumedCapacity == "TOTAL" || in.ReturnConsumedCapacity == "INDEXES" {
-		cc := &ConsumedCapacity{TableName: t.Name, CapacityUnits: writeCapacityUnits(oldCopy)}
-		if in.ReturnConsumedCapacity == "INDEXES" {
-			cc.Table = &Capacity{CapacityUnits: cc.CapacityUnits}
+		for typ, val := range av {
+			if str, isStr := val.(string); isStr && str == "" && (typ == "S" || typ == "B") {
+				deleteItemFail(w, http.StatusBadRequest, "ValidationException",
+					fmt.Sprintf("One or more parameter values were invalid: The AttributeValue for a key attribute cannot contain an empty string value. Key: %s", name))
+				return
+			}
 		}
-		out.ConsumedCapacity = cc
+		want[name] = deleteItemCanon(raw)
 	}
-	return out, nil
+
+	unlock := deleteItemAcquireLock(s)
+	defer unlock()
+
+	tables, found := deleteItemTableMap(s)
+	if !found {
+		deleteItemTableNotFound(w, in.TableName)
+		return
+	}
+	tv := tables.MapIndex(reflect.ValueOf(in.TableName))
+	if !tv.IsValid() {
+		deleteItemTableNotFound(w, in.TableName)
+		return
+	}
+	table := reflect.Indirect(tv)
+	if table.Kind() == reflect.Struct {
+		if hash, rng, known := deleteItemKeyNames(table); known {
+			if !deleteItemKeyShape(w, hash, rng, in.Key) {
+				return
+			}
+		}
+	}
+
+	var old map[string]any
+	deleted := false
+	if items, ok := deleteItemItemsValue(table); ok {
+		old, deleted = deleteItemApply(items, want)
+	}
+	if !deleted || in.ReturnValues != "ALL_OLD" {
+		deleteItemReply(w, map[string]any{})
+		return
+	}
+	deleteItemReply(w, map[string]any{"Attributes": deleteItemToWire(old)})
 }
 
-func validateReturnValues(rv string) *APIError {
-	switch rv {
-	case "", "NONE", "ALL_OLD":
-		return nil
+// deleteItemKeyShape verifies that the request key matches the table schema.
+func deleteItemKeyShape(w http.ResponseWriter, hash string, rng string, key map[string]any) bool {
+	allowed := map[string]bool{hash: true}
+	if rng != "" {
+		allowed[rng] = true
+	}
+	for name := range key {
+		if !allowed[name] {
+			deleteItemFail(w, http.StatusBadRequest, "ValidationException", "The provided key element does not match the schema")
+			return false
+		}
+	}
+	for name := range allowed {
+		if _, ok := key[name]; !ok {
+			deleteItemFail(w, http.StatusBadRequest, "ValidationException", "The provided key element does not match the schema")
+			return false
+		}
+	}
+	return true
+}
+
+func deleteItemTableNotFound(w http.ResponseWriter, name string) {
+	deleteItemFail(w, http.StatusBadRequest, "ResourceNotFoundException",
+		"Requested resource not found: Table: "+name+" not found")
+}
+
+func deleteItemReply(w http.ResponseWriter, body map[string]any) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		buf = []byte("{}")
+	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf)
+}
+
+func deleteItemFail(w http.ResponseWriter, status int, code string, msg string) {
+	buf, _ := json.Marshal(map[string]any{"__type": deleteItemErrPrefix + code, "message": msg})
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.WriteHeader(status)
+	_, _ = w.Write(buf)
+}
+
+func deleteItemRecover(w http.ResponseWriter) {
+	if rec := recover(); rec != nil {
+		deleteItemFail(w, http.StatusInternalServerError, "InternalFailure", fmt.Sprintf("%v", rec))
+	}
+}
+
+// deleteItemAcquireLock takes the store-wide mutex (when one is discoverable)
+// so the deletion is consistent with the other data-plane operations.
+func deleteItemAcquireLock(svc *Service) (unlock func()) {
+	noop := func() {}
+	root := reflect.Indirect(reflect.ValueOf(svc))
+	if root.Kind() != reflect.Struct {
+		return noop
+	}
+	mu := deleteItemFindMutex(root)
+	if !mu.IsValid() {
+		for i := 0; i < root.NumField(); i++ {
+			inner := reflect.Indirect(root.Field(i))
+			if inner.Kind() == reflect.Struct {
+				if m := deleteItemFindMutex(inner); m.IsValid() {
+					mu = m
+					break
+				}
+			}
+		}
+	}
+	if !mu.IsValid() {
+		return noop
+	}
+	mu = deleteItemExposed(mu)
+	lock, doUnlock := mu.MethodByName("Lock"), mu.MethodByName("Unlock")
+	if !lock.IsValid() || !doUnlock.IsValid() || !deleteItemSafeCall(lock) {
+		return noop
+	}
+	return func() { deleteItemSafeCall(doUnlock) }
+}
+
+func deleteItemFindMutex(v reflect.Value) reflect.Value {
+	for i := 0; i < v.NumField(); i++ {
+		ft := v.Field(i).Type()
+		if ft.PkgPath() == "sync" && (ft.Name() == "Mutex" || ft.Name() == "RWMutex") {
+			return v.Field(i)
+		}
+	}
+	return reflect.Value{}
+}
+
+func deleteItemSafeCall(m reflect.Value) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	m.Call(nil)
+	return true
+}
+
+// deleteItemTableMap returns the tables map managed by the service.
+func deleteItemTableMap(svc *Service) (reflect.Value, bool) {
+	root := reflect.Indirect(reflect.ValueOf(svc))
+	if root.Kind() != reflect.Struct {
+		return reflect.Value{}, false
+	}
+	best, bestScore := reflect.Value{}, -1
+	var visit func(v reflect.Value, depth int)
+	visit = func(v reflect.Value, depth int) {
+		if depth < 0 || v.Kind() != reflect.Struct {
+			return
+		}
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			if m, score := deleteItemTablesScore(v.Field(i), t.Field(i).Name); score > bestScore {
+				best, bestScore = m, score
+			}
+			if depth > 0 {
+				if inner := reflect.Indirect(v.Field(i)); inner.Kind() == reflect.Struct {
+					visit(inner, depth-1)
+				}
+			}
+		}
+	}
+	visit(root, 2)
+	if !best.IsValid() {
+		return reflect.Value{}, false
+	}
+	return deleteItemExposed(best), true
+}
+
+func deleteItemTablesScore(field reflect.Value, name string) (reflect.Value, int) {
+	m := reflect.Indirect(field)
+	if m.Kind() != reflect.Map || m.Type().Key().Kind() != reflect.String {
+		return reflect.Value{}, -1
+	}
+	et := m.Type().Elem()
+	if et.Kind() == reflect.Ptr {
+		et = et.Elem()
+	}
+	score := 0
+	if strings.Contains(strings.ToLower(name), "table") {
+		score += 4
+	}
+	switch et.Kind() {
+	case reflect.Struct:
+		score += 2 + min(2, deleteItemTableStructScore(et))
+	case reflect.Map, reflect.Interface:
+		score++
 	default:
-		return validationErrf("Unsupported ReturnValues: %s", rv)
+		return m, -1
 	}
+	return m, score
 }
 
-func validateReturnValuesOnConditionCheckFailure(rv string) *APIError {
-	switch rv {
-	case "", "NONE", "ALL_OLD":
-		return nil
-	default:
-		return validationErrf("Unsupported ReturnValuesOnConditionCheckFailure: %s", rv)
+func deleteItemTableStructScore(st reflect.Type) int {
+	score := 0
+	for i := 0; i < st.NumField(); i++ {
+		ft := st.Field(i).Type
+		for ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+		name := strings.ToLower(st.Field(i).Name)
+		switch ft.Kind() {
+		case reflect.Map:
+			if ft.Key().Kind() == reflect.String {
+				if ft.Elem().Kind() == reflect.String {
+					if strings.Contains(name, "key") || strings.Contains(name, "schema") {
+						score++
+					}
+				} else {
+					score++
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			score++
+		}
 	}
+	return score
 }
 
-// ---------------------------------------------------------------------------
-// Keys and attributes
-// ---------------------------------------------------------------------------
-
-// keyParts validates the request key against the table key schema and returns
-// its canonical segments in schema order (HASH first, then RANGE).
-func keyParts(t *Table, key Item) ([]string, *APIError) {
-	schema := keySchemaInOrder(t)
-	if len(key) != len(schema) {
-		return nil, keyMismatchErr()
+// deleteItemKeyNames reads the base table key schema, when discoverable.
+func deleteItemKeyNames(table reflect.Value) (string, string, bool) {
+	for _, n := range []string{"KeySchema", "keySchema"} {
+		f := reflect.Indirect(table.FieldByName(n))
+		if !f.IsValid() || (f.Kind() != reflect.Slice && f.Kind() != reflect.Array) {
+			continue
+		}
+		hash, rng := "", ""
+		for i := 0; i < f.Len(); i++ {
+			el := reflect.Indirect(f.Index(i))
+			if el.Kind() != reflect.Struct {
+				hash, rng = "", ""
+				break
+			}
+			if deleteItemStrField(el, []string{"IndexName", "indexName"}) != "" {
+				continue
+			}
+			name := deleteItemStrField(el, []string{"AttributeName", "attributeName", "Name", "name"})
+			switch strings.ToUpper(deleteItemStrField(el, []string{"KeyType", "keyType", "Type", "type"})) {
+			case "HASH":
+				hash = name
+			case "RANGE":
+				rng = name
+			}
+		}
+		if hash != "" {
+			return hash, rng, true
+		}
 	}
-	parts := make([]string, 0, len(schema))
-	for _, ks := range schema {
-		want := t.KeyTypes[ks.AttributeName]
-		if want == "" {
-			want = "S"
+	for _, n := range []string{"KeySchema", "keySchema", "KeyTypes", "keyTypes"} {
+		f := reflect.Indirect(table.FieldByName(n))
+		if !f.IsValid() || f.Kind() != reflect.Map || f.Type().Key().Kind() != reflect.String {
+			continue
 		}
-		av, ok := key[ks.AttributeName]
-		if !ok || av == nil || attrKind(av) != want {
-			return nil, keyMismatchErr()
+		hash, rng := "", ""
+		iter := f.MapRange()
+		for iter.Next() {
+			vv := iter.Value()
+			if vv.Kind() != reflect.String {
+				continue
+			}
+			attr := iter.Key().String()
+			switch strings.ToUpper(vv.String()) {
+			case "HASH":
+				hash = attr
+			case "RANGE":
+				rng = attr
+			}
 		}
-		part, apiErr := canonicalKeySegment(av, want)
-		if apiErr != nil {
-			return nil, apiErr
+		if hash != "" {
+			return hash, rng, true
 		}
-		parts = append(parts, part)
 	}
-	return parts, nil
+	var hash, rng string
+	for _, n := range []string{"HashKey", "hashKey", "PartitionKey", "partitionKey"} {
+		f := table.FieldByName(n)
+		if f.IsValid() && f.Kind() == reflect.String && f.String() != "" {
+			hash = f.String()
+			break
+		}
+	}
+	for _, n := range []string{"RangeKey", "rangeKey", "SortKey", "sortKey"} {
+		f := table.FieldByName(n)
+		if f.IsValid() && f.Kind() == reflect.String && f.String() != "" {
+			rng = f.String()
+			break
+		}
+	}
+	if hash != "" {
+		return hash, rng, true
+	}
+	return "", "", false
 }
 
-func keySchemaInOrder(t *Table) []KeySchemaElement {
-	out := append([]KeySchemaElement(nil), t.KeySchema...)
-	sort.SliceStable(out, func(i, j int) bool {
-		return keyTypeRank(out[i].KeyType) < keyTypeRank(out[j].KeyType)
-	})
-	return out
-}
-
-func keyTypeRank(kt string) int {
-	if strings.EqualFold(kt, "RANGE") {
-		return 1
-	}
-	return 0
-}
-
-func keyMismatchErr() *APIError {
-	return validationErrf("The provided key element does not match the schema")
-}
-
-func canonicalKeySegment(av *AttributeValue, typ string) (string, *APIError) {
-	switch typ {
-	case "S":
-		if av.S == nil || *av.S == "" {
-			return "", keyMismatchErr()
+func deleteItemStrField(el reflect.Value, names []string) string {
+	for _, n := range names {
+		f := reflect.Indirect(el.FieldByName(n))
+		if f.IsValid() && f.Kind() == reflect.String {
+			return f.String()
 		}
-		return *av.S, nil
-	case "N":
-		if av.N == nil {
-			return "", keyMismatchErr()
-		}
-		c, ok := canonicalNumber(*av.N)
-		if !ok {
-			return "", keyMismatchErr()
-		}
-		return c, nil
-	case "B":
-		if len(av.B) == 0 {
-			return "", keyMismatchErr()
-		}
-		return string(av.B), nil
-	}
-	return "", keyMismatchErr()
-}
-
-// attrKind returns the DynamoDB type letter(s) of v, "" for empty/unknown.
-func attrKind(v *AttributeValue) string {
-	if v == nil {
-		return ""
-	}
-	switch {
-	case v.S != nil:
-		return "S"
-	case v.N != nil:
-		return "N"
-	case v.B != nil:
-		return "B"
-	case v.BOOL != nil:
-		return "BOOL"
-	case v.NULL != nil:
-		return "NULL"
-	case v.SS != nil:
-		return "SS"
-	case v.NS != nil:
-		return "NS"
-	case v.BS != nil:
-		return "BS"
-	case v.M != nil:
-		return "M"
-	case v.L != nil:
-		return "L"
 	}
 	return ""
 }
 
-// numOf parses a DynamoDB number exactly.
-func numOf(s string) (*big.Float, bool) {
-	f, _, err := big.ParseFloat(s, 10, 512, big.ToNearestEven)
-	if err != nil {
+// deleteItemItemsValue finds the item collection of a resolved table.
+func deleteItemItemsValue(table reflect.Value) (reflect.Value, bool) {
+	if table.Kind() == reflect.Map {
+		return table, true
+	}
+	if table.Kind() != reflect.Struct {
+		return reflect.Value{}, false
+	}
+	table = deleteItemExposed(table)
+	for _, name := range []string{"Items", "items"} {
+		if f := table.FieldByName(name); f.IsValid() && deleteItemIsItemCollection(f) {
+			return deleteItemExposed(f), true
+		}
+	}
+	t := table.Type()
+	for i := 0; i < t.NumField(); i++ {
+		if strings.Contains(strings.ToLower(t.Field(i).Name), "item") && deleteItemIsItemCollection(table.Field(i)) {
+			return deleteItemExposed(table.Field(i)), true
+		}
+	}
+	for _, name := range []string{"Rows", "rows", "Records", "records", "Entries", "entries", "Data", "data"} {
+		if f := table.FieldByName(name); f.IsValid() && deleteItemIsItemCollection(f) {
+			return deleteItemExposed(f), true
+		}
+	}
+	for _, word := range []string{"item", "value", "object", "element", "row", "record", "entry"} {
+		for i := 0; i < t.NumField(); i++ {
+			if strings.Contains(strings.ToLower(t.Field(i).Name), word) && deleteItemIsItemCollection(table.Field(i)) {
+				return deleteItemExposed(table.Field(i)), true
+			}
+		}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.ToLower(t.Field(i).Name)
+		if strings.Contains(name, "key") || strings.Contains(name, "index") ||
+			strings.Contains(name, "attribute") || strings.Contains(name, "schema") {
+			continue
+		}
+		if deleteItemIsItemCollection(table.Field(i)) {
+			return deleteItemExposed(table.Field(i)), true
+		}
+	}
+	return reflect.Value{}, false
+}
+
+func deleteItemIsItemCollection(field reflect.Value) bool {
+	f := reflect.Indirect(field)
+	var et reflect.Type
+	switch f.Kind() {
+	case reflect.Map:
+		if f.Type().Key().Kind() != reflect.String {
+			return false
+		}
+		et = f.Type().Elem()
+	case reflect.Slice:
+		et = f.Type().Elem()
+	default:
+		return false
+	}
+	if et.Kind() == reflect.Ptr {
+		et = et.Elem()
+	}
+	switch et.Kind() {
+	case reflect.Map, reflect.Interface:
+		return true
+	case reflect.Struct:
+		return deleteItemTableStructScore(et) == 0
+	}
+	return false
+}
+
+// deleteItemApply removes the first item whose key attributes equal want.
+func deleteItemApply(items reflect.Value, want map[string]any) (map[string]any, bool) {
+	switch items.Kind() {
+	case reflect.Map:
+		if items.Type().Key().Kind() != reflect.String {
+			return nil, false
+		}
+		var id reflect.Value
+		var old map[string]any
+		iter := items.MapRange()
+		for iter.Next() {
+			attrs, ok := deleteItemAttrsOf(iter.Value())
+			if !ok || !deleteItemKeyMatches(attrs, want) {
+				continue
+			}
+			id, old = iter.Key(), attrs
+			break
+		}
+		if !id.IsValid() {
+			return nil, false
+		}
+		if !deleteItemDropMapKey(items, id) {
+			return nil, false
+		}
+		return old, true
+	case reflect.Slice:
+		for i := 0; i < items.Len(); i++ {
+			attrs, ok := deleteItemAttrsOf(items.Index(i))
+			if !ok || !deleteItemKeyMatches(attrs, want) {
+				continue
+			}
+			if !items.CanSet() {
+				return nil, false
+			}
+			next := reflect.MakeSlice(items.Type(), items.Len()-1, items.Len()-1)
+			out := 0
+			for j := 0; j < items.Len(); j++ {
+				if j == i {
+					continue
+				}
+				next.Index(out).Set(items.Index(j))
+				out++
+			}
+			items.Set(next)
+			return attrs, true
+		}
+	}
+	return nil, false
+}
+
+func deleteItemDropMapKey(items reflect.Value, id reflect.Value) (dropped bool) {
+	defer func() {
+		if recover() != nil {
+			dropped = false
+		}
+	}()
+	items.SetMapIndex(id, reflect.Zero(items.Type().Elem()))
+	return true
+}
+
+func deleteItemAttrsOf(elem reflect.Value) (out map[string]any, ok bool) {
+	defer func() {
+		if recover() != nil {
+			out, ok = nil, false
+		}
+	}()
+	e := reflect.Indirect(elem)
+	switch e.Kind() {
+	case reflect.Map:
+		if e.Type().Key().Kind() != reflect.String {
+			return nil, false
+		}
+		m := make(map[string]any, e.Len())
+		iter := e.MapRange()
+		for iter.Next() {
+			m[iter.Key().String()] = iter.Value().Interface()
+		}
+		return m, true
+	case reflect.Struct:
+		return deleteItemStructMap(e), true
+	}
+	return nil, false
+}
+
+func deleteItemKeyMatches(item map[string]any, want map[string]any) bool {
+	for name, expected := range want {
+		stored, ok := item[name]
+		if !ok || !reflect.DeepEqual(deleteItemCanon(stored), expected) {
+			return false
+		}
+	}
+	return true
+}
+
+// deleteItemScalar is the canonical comparable form of an attribute value.
+type deleteItemScalar struct {
+	kind byte
+	str  string
+	flag bool
+}
+
+// deleteItemCanon maps an attribute value (wire-shaped, native or named
+// wrapper) onto its canonical comparable form.
+func deleteItemCanon(v any) any {
+	switch t := v.(type) {
+	case nil:
+		return deleteItemScalar{kind: 'z'}
+	case bool:
+		return deleteItemScalar{kind: 'b', flag: t}
+	case string:
+		return deleteItemScalar{kind: 's', str: t}
+	case json.Number:
+		return deleteItemScalar{kind: 'n', str: deleteItemNormNum(t.String())}
+	case map[string]any:
+		if out, ok := deleteItemCanonTyped(t); ok {
+			return out
+		}
+		return deleteItemCanonMap(t)
+	case []any:
+		return deleteItemCanonList(t)
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr:
+		if rv.IsNil() {
+			return deleteItemScalar{kind: 'z'}
+		}
+		return deleteItemCanon(rv.Elem().Interface())
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return v
+		}
+		m := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			m[iter.Key().String()] = iter.Value().Interface()
+		}
+		if out, ok := deleteItemCanonTyped(m); ok {
+			return out
+		}
+		return deleteItemCanonMap(m)
+	case reflect.Struct:
+		m := deleteItemStructMap(rv)
+		if out, ok := deleteItemCanonTyped(m); ok {
+			return out
+		}
+		return deleteItemCanonMap(m)
+	case reflect.Slice, reflect.Array:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = deleteItemCanon(rv.Index(i).Interface())
+		}
+		return out
+	default:
+		if num := fmt.Sprintf("%v", v); num != "" {
+			if _, err := strconv.ParseFloat(num, 64); err == nil {
+				return deleteItemScalar{kind: 'n', str: deleteItemNormNum(num)}
+			}
+		}
+		return v
+	}
+}
+
+// deleteItemCanonTyped recognizes AttributeValue-like maps (wire encoding or
+// struct tagged values) and yields their canonical scalar.
+func deleteItemCanonTyped(m map[string]any) (any, bool) {
+	key := ""
+	var picked any
+	count := 0
+	for k, inner := range m {
+		if !deleteItemAVTypes[k] {
+			return nil, false
+		}
+		if inner != nil {
+			key, picked = k, inner
+			count++
+		}
+	}
+	if count != 1 {
 		return nil, false
 	}
-	return f, true
+	if rv := reflect.ValueOf(picked); rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return deleteItemScalar{kind: 'z'}, true
+		}
+		picked = rv.Elem().Interface()
+	}
+	switch key {
+	case "S", "B":
+		if s, ok := picked.(string); ok {
+			return deleteItemScalar{kind: 's', str: s}, true
+		}
+	case "N":
+		if jn, ok := picked.(json.Number); ok {
+			return deleteItemScalar{kind: 'n', str: deleteItemNormNum(jn.String())}, true
+		}
+		if num := fmt.Sprintf("%v", picked); num != "" {
+			if _, err := strconv.ParseFloat(num, 64); err == nil {
+				return deleteItemScalar{kind: 'n', str: deleteItemNormNum(num)}, true
+			}
+		}
+	case "BOOL":
+		if b, ok := picked.(bool); ok {
+			return deleteItemScalar{kind: 'b', flag: b}, true
+		}
+	case "NULL":
+		return deleteItemScalar{kind: 'z'}, true
+	case "M":
+		if mm, ok := picked.(map[string]any); ok {
+			return deleteItemCanonMap(mm), true
+		}
+	case "L", "SS", "NS", "BS":
+		if ll, ok := picked.([]any); ok {
+			return deleteItemCanonList(ll), true
+		}
+	}
+	return nil, false
 }
 
-// canonicalNumber normalizes DynamoDB numbers so that "1", "1.0" and "1e0"
-// produce the same string (used for keying and numeric comparison).
-func canonicalNumber(s string) (string, bool) {
-	f, ok := numOf(s)
-	if !ok {
-		return "", false
-	}
-	return f.Text('f', -1), true
-}
-
-func identityCanon(s string) (string, bool) { return s, true }
-
-// cloneItem deep-copies an item so returned values cannot alias live storage.
-func cloneItem(it Item) Item {
-	if it == nil {
-		return nil
-	}
-	out := make(Item, len(it))
-	for k, v := range it {
-		out[k] = cloneValue(v)
+func deleteItemCanonMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, vv := range m {
+		out[k] = deleteItemCanon(vv)
 	}
 	return out
 }
 
-func cloneValue(v *AttributeValue) *AttributeValue {
-	if v == nil {
-		return nil
+func deleteItemCanonList(l []any) []any {
+	out := make([]any, len(l))
+	for i := range l {
+		out[i] = deleteItemCanon(l[i])
 	}
-	nv := &AttributeValue{}
-	if v.S != nil {
-		s := *v.S
-		nv.S = &s
-	}
-	if v.N != nil {
-		s := *v.N
-		nv.N = &s
-	}
-	if v.B != nil {
-		nv.B = append([]byte(nil), v.B...)
-	}
-	if v.BOOL != nil {
-		b := *v.BOOL
-		nv.BOOL = &b
-	}
-	if v.NULL != nil {
-		b := *v.NULL
-		nv.NULL = &b
-	}
-	if v.SS != nil {
-		nv.SS = append([]string(nil), v.SS...)
-	}
-	if v.NS != nil {
-		nv.NS = append([]string(nil), v.NS...)
-	}
-	if v.BS != nil {
-		nv.BS = make([][]byte, len(v.BS))
-		for i, b := range v.BS {
-			nv.BS[i] = append([]byte(nil), b...)
-		}
-	}
-	if v.M != nil {
-		nv.M = make(map[string]*AttributeValue, len(v.M))
-		for k, mv := range v.M {
-			nv.M[k] = cloneValue(mv)
-		}
-	}
-	if v.L != nil {
-		nv.L = make([]*AttributeValue, len(v.L))
-		for i, lv := range v.L {
-			nv.L[i] = cloneValue(lv)
-		}
-	}
-	return nv
+	return out
 }
 
-func mustJSON(v any) json.RawMessage {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return json.RawMessage("null")
-	}
-	return b
-}
-
-func itemWireSize(it Item) int {
-	b, err := json.Marshal(it)
-	if err != nil {
-		return 1
-	}
-	return len(b)
-}
-
-// writeCapacityUnits: one WCU per 1 KB of the (deleted) item, minimum 1.
-func writeCapacityUnits(it Item) float64 {
-	if it == nil {
-		return 1
-	}
-	units := math.Ceil(float64(itemWireSize(it)) / 1024)
-	if units < 1 {
-		units = 1
-	}
-	return units
-}
-
-// ---------------------------------------------------------------------------
-// Conditions (ConditionExpression + legacy Expected)
-// ---------------------------------------------------------------------------
-
-// evalDeleteConditions evaluates the request conditions against the
-// pre-delete item state (old == nil when the key did not exist).
-func evalDeleteConditions(in *DeleteItemInput, old Item) (bool, *APIError) {
-	if in.ConditionExpression != "" && len(in.Expected) > 0 {
-		return false, validationErrf("The ConditionExpression parameter and the Expected parameter cannot be used at the same time")
-	}
-	if in.ConditionExpression != "" {
-		fn, apiErr := compileCondition(in.ConditionExpression, in.ExpressionAttributeNames, in.ExpressionAttributeValues)
-		if apiErr != nil {
-			return false, apiErr
-		}
-		return fn(old), nil
-	}
-	if len(in.Expected) > 0 {
-		return evalExpectedConditions(in.Expected, in.ConditionalOperator, old)
-	}
-	return true, nil
-}
-
-func evalExpectedConditions(expected map[string]*ExpectedCondition, op string, old Item) (bool, *APIError) {
-	mode := strings.ToUpper(strings.TrimSpace(op))
-	if mode == "" {
-		mode = "AND"
-	}
-	if mode != "AND" && mode != "OR" {
-		return false, validationErrf("ConditionalOperator must be one of AND, OR")
-	}
-	result := mode == "AND"
-	for attr, exp := range expected {
-		if exp == nil {
+func deleteItemStructMap(rv reflect.Value) map[string]any {
+	t := rv.Type()
+	out := make(map[string]any, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" {
 			continue
 		}
-		ok, apiErr := evalOneExpected(old, attr, exp)
-		if apiErr != nil {
-			return false, apiErr
-		}
-		if mode == "AND" && !ok {
-			return false, nil
-		}
-		if mode == "OR" && ok {
-			return true, nil
-		}
-	}
-	return result, nil
-}
-
-func evalOneExpected(item Item, attr string, exp *ExpectedCondition) (bool, *APIError) {
-	v, ok := resolveAttrPath(item, []pathSeg{{name: attr}})
-	if exp.ComparisonOperator != "" {
-		return evalComparisonOperator(exp.ComparisonOperator, v, ok, exp.AttributeValueList), nil
-	}
-	cond := ok
-	if exp.Exists != nil {
-		cond = ok == *exp.Exists
-	}
-	if exp.Value != nil {
-		cond = cond && ok && attrEqual(v, exp.Value)
-	}
-	return cond, nil
-}
-
-func evalComparisonOperator(op string, v *AttributeValue, ok bool, list []*AttributeValue) bool {
-	at := func(i int) *AttributeValue {
-		if i < len(list) {
-			return list[i]
-		}
-		return nil
-	}
-	switch strings.ToUpper(strings.TrimSpace(op)) {
-	case "EQ":
-		return ok && len(list) > 0 && attrEqual(v, at(0))
-	case "NE":
-		return ok && len(list) > 0 && !attrEqual(v, at(0))
-	case "LE":
-		if !ok {
-			return false
-		}
-		c, cmpOK := cmpOrder(v, at(0))
-		return cmpOK && c <= 0
-	case "LT":
-		if !ok {
-			return false
-		}
-		c, cmpOK := cmpOrder(v, at(0))
-		return cmpOK && c < 0
-	case "GE":
-		if !ok {
-			return false
-		}
-		c, cmpOK := cmpOrder(v, at(0))
-		return cmpOK && c >= 0
-	case "GT":
-		if !ok {
-			return false
-		}
-		c, cmpOK := cmpOrder(v, at(0))
-		return cmpOK && c > 0
-	case "BETWEEN":
-		if !ok {
-			return false
-		}
-		cLo, okLo := cmpOrder(v, at(0))
-		if !okLo || cLo < 0 {
-			return false
-		}
-		cHi, okHi := cmpOrder(v, at(1))
-		return okHi && cHi >= 0
-	case "IN":
-		if !ok {
-			return false
-		}
-		for _, o := range list {
-			if o != nil && attrEqual(v, o) {
-				return true
+		name := sf.Name
+		if tag, tagged := sf.Tag.Lookup("json"); tagged {
+			if parts := strings.Split(tag, ","); parts[0] != "" {
+				name = parts[0]
 			}
 		}
-		return false
-	case "CONTAINS":
-		return ok && len(list) > 0 && containsValue(v, at(0))
-	case "NOT_CONTAINS":
-		return ok && !(len(list) > 0 && containsValue(v, at(0)))
-	case "BEGINS_WITH":
-		if !ok || len(list) == 0 {
-			return false
-		}
-		return attrKind(v) == "S" && attrKind(at(0)) == "S" && strings.HasPrefix(*v.S, *at(0).S)
-	case "NULL":
-		return !ok
-	case "NOT_NULL":
-		return ok
+		out[name] = rv.Field(i).Interface()
 	}
-	return false
+	return out
 }
 
-// ---------------------------------------------------------------------------
-// ConditionExpression parser / evaluator
-// ---------------------------------------------------------------------------
-
-type condOperand func(item Item) (*AttributeValue, bool)
-type condPredicate func(item Item) bool
-
-type pathSeg struct {
-	name    string
-	index   int
-	isIndex bool
-}
-
-type condToken struct {
-	kind string // id, num, str, name, ref, op, lparen, rparen, comma, dot, lbrack, rbrack
-	text string
-}
-
-var condFunctions = map[string]bool{
-	"attribute_exists":     true,
-	"attribute_not_exists": true,
-	"begins_with":          true,
-	"contains":             true,
-}
-
-type condParser struct {
-	toks   []condToken
-	pos    int
-	names  map[string]string
-	values map[string]*AttributeValue
-}
-
-// compileCondition parses a condition expression into a predicate over items.
-func compileCondition(expr string, names map[string]string, values map[string]*AttributeValue) (condPredicate, *APIError) {
-	toks, apiErr := lexCondition(expr)
-	if apiErr != nil {
-		return nil, apiErr
+// deleteItemNormNum normalizes numeric text so equal DynamoDB numbers compare
+// equal regardless of formatting.
+func deleteItemNormNum(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
 	}
-	if len(toks) == 0 {
-		return nil, validationErrf("Invalid ConditionExpression: empty expression")
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return strconv.FormatFloat(f, 'g', -1, 64)
 	}
-	p := &condParser{toks: toks, names: names, values: values}
-	fn, apiErr := p.parseOr()
-	if apiErr != nil {
-		return nil, apiErr
+	t := strings.TrimPrefix(s, "+")
+	neg := strings.HasPrefix(t, "-")
+	t = strings.TrimPrefix(t, "-")
+	if !strings.ContainsAny(t, "eE") && strings.Contains(t, ".") {
+		t = strings.TrimRight(t, "0")
+		t = strings.TrimSuffix(t, ".")
 	}
-	if p.pos != len(p.toks) {
-		return nil, validationErrf("Invalid ConditionExpression: unexpected token %q", p.toks[p.pos].text)
+	t = strings.TrimLeft(t, "0")
+	if t == "" {
+		t = "0"
 	}
-	return fn, nil
-}
-
-func lexCondition(expr string) ([]condToken, *APIError) {
-	var toks []condToken
-	i, n := 0, len(expr)
-	isIdent := func(c byte) bool {
-		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
-	}
-	for i < n {
-		c := expr[i]
-		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
-			i++
-		case c == '(':
-			toks = append(toks, condToken{"lparen", "("})
-			i++
-		case c == ')':
-			toks = append(toks, condToken{"rparen", ")"})
-			i++
-		case c == ',':
-			toks = append(toks, condToken{"comma", ","})
-			i++
-		case c == '.':
-			toks = append(toks, condToken{"dot", "."})
-			i++
-		case c == '[':
-			toks = append(toks, condToken{"lbrack", "["})
-			i++
-		case c == ']':
-			toks = append(toks, condToken{"rbrack", "]"})
-			i++
-		case c == '#':
-			j := i + 1
-			for j < n && isIdent(expr[j]) {
-				j++
-			}
-			if j == i+1 {
-				return nil, validationErrf("Invalid ConditionExpression: empty attribute name placeholder")
-			}
-			toks = append(toks, condToken{"name", expr[i:j]})
-			i = j
-		case c == ':':
-			j := i + 1
-			for j < n && isIdent(expr[j]) {
-				j++
-			}
-			if j == i+1 {
-				return nil, validationErrf("Invalid ConditionExpression: empty value placeholder")
-			}
-			toks = append(toks, condToken{"ref", expr[i:j]})
-			i = j
-		case c == '\'' || c == '"':
-			s, ni, err := lexQuoted(expr, i, c)
-			if err != nil {
-				return nil, validationErrf("Invalid ConditionExpression: %s", err.Error())
-			}
-			toks = append(toks, condToken{"str", s})
-			i = ni
-		case c == '=':
-			toks = append(toks, condToken{"op", "="})
-			i++
-		case c == '<':
-			if i+1 < n && expr[i+1] == '>' {
-				toks = append(toks, condToken{"op", "<>"})
-				i += 2
-			} else if i+1 < n && expr[i+1] == '=' {
-				toks = append(toks, condToken{"op", "<="})
-				i += 2
-			} else {
-				toks = append(toks, condToken{"op", "<"})
-				i++
-			}
-		case c == '>':
-			if i+1 < n && expr[i+1] == '=' {
-				toks = append(toks, condToken{"op", ">="})
-				i += 2
-			} else {
-				toks = append(toks, condToken{"op", ">"})
-				i++
-			}
-		case c >= '0' && c <= '9':
-			j := i
-			for j < n && expr[j] >= '0' && expr[j] <= '9' {
-				j++
-			}
-			toks = append(toks, condToken{"num", expr[i:j]})
-			i = j
-		case isIdent(c):
-			j := i
-			for j < n && isIdent(expr[j]) {
-				j++
-			}
-			toks = append(toks, condToken{"id", expr[i:j]})
-			i = j
-		default:
-			return nil, validationErrf("Invalid ConditionExpression: unexpected character %q", string(c))
-		}
-	}
-	return toks, nil
-}
-
-func lexQuoted(s string, i int, q byte) (string, int, error) {
-	i++ // opening quote
-	var sb strings.Builder
-	for i < len(s) {
-		if s[i] == q {
-			if i+1 < len(s) && s[i+1] == q {
-				sb.WriteByte(q)
-				i += 2
-				continue
-			}
-			i++
-			return sb.String(), i, nil
-		}
-		sb.WriteByte(s[i])
-		i++
-	}
-	return "", 0, fmt.Errorf("unterminated string literal")
-}
-
-func (p *condParser) peek() *condToken {
-	if p.pos < len(p.toks) {
-		return &p.toks[p.pos]
-	}
-	return nil
-}
-
-func (p *condParser) peekAt(off int) *condToken {
-	if p.pos+off < len(p.toks) {
-		return &p.toks[p.pos+off]
-	}
-	return nil
-}
-
-func (p *condParser) next() *condToken {
-	t := p.peek()
-	if t != nil {
-		p.pos++
+	if neg && t != "0" {
+		return "-" + t
 	}
 	return t
 }
 
-func (p *condParser) isKeyword(t *condToken, kw string) bool {
-	return t != nil && t.kind == "id" && strings.EqualFold(t.text, kw)
+// deleteItemToWire converts natively stored attributes to the wire-shaped
+// AttributeValue encoding; wire-shaped and struct-typed values pass through.
+func deleteItemToWire(old map[string]any) map[string]any {
+	for _, v := range old {
+		if !deleteItemIsWireAV(v) {
+			out := make(map[string]any, len(old))
+			for k, vv := range old {
+				out[k] = deleteItemToAV(vv)
+			}
+			return out
+		}
+	}
+	return old
 }
 
-func (p *condParser) parseOr() (condPredicate, *APIError) {
-	left, apiErr := p.parseAnd()
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	for p.isKeyword(p.peek(), "OR") {
-		p.pos++
-		right, apiErr := p.parseAnd()
-		if apiErr != nil {
-			return nil, apiErr
+func deleteItemIsWireAV(v any) bool {
+	if m, ok := v.(map[string]any); ok {
+		if len(m) != 1 {
+			return false
 		}
-		left = func(l, r condPredicate) condPredicate {
-			return func(it Item) bool { return l(it) || r(it) }
-		}(left, right)
-	}
-	return left, nil
-}
-
-func (p *condParser) parseAnd() (condPredicate, *APIError) {
-	left, apiErr := p.parseNot()
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	for p.isKeyword(p.peek(), "AND") {
-		p.pos++
-		right, apiErr := p.parseNot()
-		if apiErr != nil {
-			return nil, apiErr
+		for k := range m {
+			return deleteItemAVTypes[k]
 		}
-		left = func(l, r condPredicate) condPredicate {
-			return func(it Item) bool { return l(it) && r(it) }
-		}(left, right)
+		return false
 	}
-	return left, nil
-}
-
-func (p *condParser) parseNot() (condPredicate, *APIError) {
-	if p.isKeyword(p.peek(), "NOT") {
-		p.pos++
-		inner, apiErr := p.parseNot()
-		if apiErr != nil {
-			return nil, apiErr
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String || rv.Len() != 1 {
+			return false
 		}
-		return func(f condPredicate) condPredicate {
-			return func(it Item) bool { return !f(it) }
-		}(inner), nil
-	}
-	return p.parsePrimary()
-}
-
-func (p *condParser) parsePrimary() (condPredicate, *APIError) {
-	t := p.peek()
-	if t == nil {
-		return nil, validationErrf("Invalid ConditionExpression: unexpected end of expression")
-	}
-	if t.kind == "lparen" {
-		p.pos++
-		inner, apiErr := p.parseOr()
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		if p.peek() == nil || p.peek().kind != "rparen" {
-			return nil, validationErrf("Invalid ConditionExpression: expected )")
-		}
-		p.pos++
-		return inner, nil
-	}
-	if t.kind == "id" {
-		if _, isFn := condFunctions[t.text]; isFn {
-			if nt := p.peekAt(1); nt != nil && nt.kind == "lparen" {
-				return p.parseCall()
-			}
-		}
-	}
-
-	left, apiErr := p.parseOperand()
-	if apiErr != nil {
-		return nil, apiErr
-	}
-	opTok := p.peek()
-	if opTok != nil && opTok.kind == "op" {
-		p.pos++
-		right, apiErr := p.parseOperand()
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		op := opTok.text
-		return func(it Item) bool {
-			lv, lok := left(it)
-			rv, rok := right(it)
-			if !lok || !rok {
-				return false
-			}
-			return compareValues(op, lv, rv)
-		}, nil
-	}
-	if p.isKeyword(opTok, "BETWEEN") {
-		p.pos++
-		lowOp, apiErr := p.parseOperand()
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		if !p.isKeyword(p.peek(), "AND") {
-			return nil, validationErrf("Invalid ConditionExpression: expected AND in BETWEEN")
-		}
-		p.pos++
-		highOp, apiErr := p.parseOperand()
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		return func(it Item) bool {
-			lv, lok := left(it)
-			if !lok {
-				return false
-			}
-			lov, _ := lowOp(it)
-			hiv, _ := highOp(it)
-			cLo, okLo := cmpOrder(lv, lov)
-			if !okLo || cLo < 0 {
-				return false
-			}
-			cHi, okHi := cmpOrder(lv, hiv)
-			return okHi && cHi >= 0
-		}, nil
-	}
-	if p.isKeyword(opTok, "IN") {
-		p.pos++
-		if p.peek() == nil || p.peek().kind != "lparen" {
-			return nil, validationErrf("Invalid ConditionExpression: expected ( after IN")
-		}
-		p.pos++
-		var rhs []condOperand
-		for {
-			o, apiErr := p.parseOperand()
-			if apiErr != nil {
-				return nil, apiErr
-			}
-			rhs = append(rhs, o)
-			if pt := p.peek(); pt != nil && pt.kind == "comma" {
-				p.pos++
+		iter := rv.MapRange()
+		iter.Next()
+		return deleteItemAVTypes[iter.Key().String()]
+	case reflect.Struct:
+		t := rv.Type()
+		fields, nonNil := 0, 0
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" {
 				continue
 			}
-			break
-		}
-		if p.peek() == nil || p.peek().kind != "rparen" {
-			return nil, validationErrf("Invalid ConditionExpression: expected ) after IN list")
-		}
-		p.pos++
-		return func(it Item) bool {
-			lv, lok := left(it)
-			if !lok {
+			tag, tagged := f.Tag.Lookup("json")
+			if !tagged {
 				return false
 			}
-			for _, o := range rhs {
-				ov, ok := o(it)
-				if ok && attrEqual(lv, ov) {
-					return true
-				}
-			}
-			return false
-		}, nil
-	}
-	return nil, validationErrf("Invalid ConditionExpression: expected a comparison, a function, BETWEEN or IN")
-}
-
-func (p *condParser) parseCall() (condPredicate, *APIError) {
-	nameTok := p.next()
-	p.next() // consume (
-	var args []condOperand
-	for {
-		arg, apiErr := p.parseOperand()
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		args = append(args, arg)
-		if pt := p.peek(); pt != nil && pt.kind == "comma" {
-			p.pos++
-			continue
-		}
-		break
-	}
-	if p.peek() == nil || p.peek().kind != "rparen" {
-		return nil, validationErrf("Invalid ConditionExpression: expected ) after function arguments")
-	}
-	p.pos++
-
-	switch nameTok.text {
-	case "attribute_exists":
-		if len(args) != 1 {
-			return nil, validationErrf("Invalid ConditionExpression: attribute_exists requires one argument")
-		}
-		arg := args[0]
-		return func(it Item) bool {
-			_, ok := arg(it)
-			return ok
-		}, nil
-	case "attribute_not_exists":
-		if len(args) != 1 {
-			return nil, validationErrf("Invalid ConditionExpression: attribute_not_exists requires one argument")
-		}
-		arg := args[0]
-		return func(it Item) bool {
-			_, ok := arg(it)
-			return !ok
-		}, nil
-	case "begins_with":
-		if len(args) != 2 {
-			return nil, validationErrf("Invalid ConditionExpression: begins_with requires two arguments")
-		}
-		valOp, prefixOp := args[0], args[1]
-		return func(it Item) bool {
-			v, ok := valOp(it)
-			if !ok || attrKind(v) != "S" {
+			if !deleteItemAVTypes[strings.Split(tag, ",")[0]] {
 				return false
 			}
-			pre, ok2 := prefixOp(it)
-			if !ok2 || attrKind(pre) != "S" {
-				return false
-			}
-			return strings.HasPrefix(*v.S, *pre.S)
-		}, nil
-	case "contains":
-		if len(args) != 2 {
-			return nil, validationErrf("Invalid ConditionExpression: contains requires two arguments")
-		}
-		valOp, subOp := args[0], args[1]
-		return func(it Item) bool {
-			v, ok := valOp(it)
-			if !ok {
-				return false
-			}
-			sub, _ := subOp(it)
-			return containsValue(v, sub)
-		}, nil
-	}
-	return nil, validationErrf("Invalid ConditionExpression: unknown function %s", nameTok.text)
-}
-
-func (p *condParser) parseOperand() (condOperand, *APIError) {
-	t := p.next()
-	if t == nil {
-		return nil, validationErrf("Invalid ConditionExpression: unexpected end of expression")
-	}
-	switch t.kind {
-	case "str":
-		sv := t.text
-		return func(Item) (*AttributeValue, bool) { return &AttributeValue{S: &sv}, true }, nil
-	case "ref":
-		v, ok := p.values[t.text]
-		if !ok || v == nil {
-			return nil, validationErrf("Invalid ConditionExpression: An expression attribute value used in expression is not defined: %s", t.text)
-		}
-		return func(Item) (*AttributeValue, bool) { return v, true }, nil
-	case "id":
-		if t.text == "size" && p.peek() != nil && p.peek().kind == "lparen" {
-			p.pos++
-			nt := p.next()
-			if nt == nil || (nt.kind != "id" && nt.kind != "name") {
-				return nil, validationErrf("Invalid ConditionExpression: expected attribute path in size()")
-			}
-			segs, apiErr := p.parsePathSegments(nt)
-			if apiErr != nil {
-				return nil, apiErr
-			}
-			if p.peek() == nil || p.peek().kind != "rparen" {
-				return nil, validationErrf("Invalid ConditionExpression: expected ) after size() path")
-			}
-			p.pos++
-			return func(it Item) (*AttributeValue, bool) {
-				v, ok := resolveAttrPath(it, segs)
-				if !ok {
-					return nil, false
-				}
-				s, ok := sizeOfAttr(v)
-				if !ok {
-					return nil, false
-				}
-				ns := strconv.Itoa(s)
-				return &AttributeValue{N: &ns}, true
-			}, nil
-		}
-		segs, apiErr := p.parsePathSegments(t)
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		return func(it Item) (*AttributeValue, bool) { return resolveAttrPath(it, segs) }, nil
-	case "name":
-		segs, apiErr := p.parsePathSegments(t)
-		if apiErr != nil {
-			return nil, apiErr
-		}
-		return func(it Item) (*AttributeValue, bool) { return resolveAttrPath(it, segs) }, nil
-	}
-	return nil, validationErrf("Invalid ConditionExpression: unexpected token %q", t.text)
-}
-
-// parsePathSegments parses an attribute path whose head token is head.
-func (p *condParser) parsePathSegments(head *condToken) ([]pathSeg, *APIError) {
-	var segs []pathSeg
-	switch head.kind {
-	case "name":
-		attr, ok := p.names[head.text]
-		if !ok {
-			return nil, validationErrf("Invalid ConditionExpression: An expression attribute name used in expression is not defined: %s", head.text)
-		}
-		segs = append(segs, pathSeg{name: attr})
-	case "id":
-		segs = append(segs, pathSeg{name: head.text})
-	default:
-		return nil, validationErrf("Invalid ConditionExpression: expected attribute path")
-	}
-	for {
-		t := p.peek()
-		if t == nil {
-			return segs, nil
-		}
-		switch t.kind {
-		case "dot":
-			p.pos++
-			nt := p.next()
-			if nt == nil || (nt.kind != "id" && nt.kind != "name") {
-				return nil, validationErrf("Invalid ConditionExpression: expected attribute name after '.'")
-			}
-			name := nt.text
-			if nt.kind == "name" {
-				resolved, ok := p.names[name]
-				if !ok {
-					return nil, validationErrf("Invalid ConditionExpression: An expression attribute name used in expression is not defined: %s", name)
-				}
-				name = resolved
-			}
-			segs = append(segs, pathSeg{name: name})
-		case "lbrack":
-			p.pos++
-			nt := p.next()
-			if nt == nil || nt.kind != "num" {
-				return nil, validationErrf("Invalid ConditionExpression: expected list index after '['")
-			}
-			idx, err := strconv.Atoi(nt.text)
-			if err != nil {
-				return nil, validationErrf("Invalid ConditionExpression: bad list index %s", nt.text)
-			}
-			if p.peek() == nil || p.peek().kind != "rbrack" {
-				return nil, validationErrf("Invalid ConditionExpression: expected ']'")
-			}
-			p.pos++
-			segs = append(segs, pathSeg{index: idx, isIndex: true})
-		default:
-			return segs, nil
-		}
-	}
-}
-
-// resolveAttrPath walks an item along the parsed path.
-func resolveAttrPath(item Item, segs []pathSeg) (*AttributeValue, bool) {
-	var cur *AttributeValue
-	for i, seg := range segs {
-		if i == 0 {
-			if seg.isIndex {
-				return nil, false
-			}
-			v, ok := item[seg.name]
-			if !ok {
-				return nil, false
-			}
-			cur = v
-		} else {
-			if cur == nil {
-				return nil, false
-			}
-			if seg.isIndex {
-				if cur.L == nil || seg.index < 0 || seg.index >= len(cur.L) {
-					return nil, false
-				}
-				cur = cur.L[seg.index]
-			} else {
-				if cur.M == nil {
-					return nil, false
-				}
-				v, ok := cur.M[seg.name]
-				if !ok {
-					return nil, false
-				}
-				cur = v
+			fields++
+			if !rv.Field(i).IsZero() {
+				nonNil++
 			}
 		}
-		if cur == nil {
-			return nil, false
-		}
-	}
-	return cur, true
-}
-
-func sizeOfAttr(v *AttributeValue) (int, bool) {
-	switch attrKind(v) {
-	case "S":
-		return len(*v.S), true
-	case "B":
-		return len(v.B), true
-	case "SS":
-		return len(v.SS), true
-	case "NS":
-		return len(v.NS), true
-	case "BS":
-		return len(v.BS), true
-	case "M":
-		return len(v.M), true
-	case "L":
-		return len(v.L), true
-	}
-	return 0, false
-}
-
-func compareValues(op string, a, b *AttributeValue) bool {
-	switch op {
-	case "=":
-		return attrEqual(a, b)
-	case "<>":
-		return !attrEqual(a, b)
-	}
-	c, ok := cmpOrder(a, b)
-	if !ok {
-		return false
-	}
-	switch op {
-	case "<":
-		return c < 0
-	case "<=":
-		return c <= 0
-	case ">":
-		return c > 0
-	case ">=":
-		return c >= 0
+		return fields > 0 && nonNil == 1
 	}
 	return false
 }
 
-// cmpOrder implements ordering comparison for S and N values.
-func cmpOrder(a, b *AttributeValue) (int, bool) {
-	ka, kb := attrKind(a), attrKind(b)
-	if ka == "S" && kb == "S" {
-		return strings.Compare(*a.S, *b.S), true
+func deleteItemToAV(v any) any {
+	if deleteItemIsWireAV(v) {
+		return v
 	}
-	if ka == "N" && kb == "N" {
-		fa, oka := numOf(*a.N)
-		fb, okb := numOf(*b.N)
-		if !oka || !okb {
-			return 0, false
+	switch t := v.(type) {
+	case nil:
+		return map[string]any{"NULL": true}
+	case bool:
+		return map[string]any{"BOOL": t}
+	case string:
+		return map[string]any{"S": t}
+	case []byte:
+		return map[string]any{"B": base64.StdEncoding.EncodeToString(t)}
+	case float64:
+		return map[string]any{"N": strconv.FormatFloat(t, 'g', -1, 64)}
+	case float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return map[string]any{"N": deleteItemNormNum(fmt.Sprintf("%v", t))}
+	case []any:
+		out := make([]any, len(t))
+		for i := range t {
+			out[i] = deleteItemToAV(t[i])
 		}
-		return fa.Cmp(fb), true
-	}
-	return 0, false
-}
-
-func attrEqual(a, b *AttributeValue) bool {
-	ka, kb := attrKind(a), attrKind(b)
-	if ka == "" || kb == "" || ka != kb {
-		return false
-	}
-	switch ka {
-	case "S":
-		return *a.S == *b.S
-	case "N":
-		fa, oka := numOf(*a.N)
-		fb, okb := numOf(*b.N)
-		return oka && okb && fa.Cmp(fb) == 0
-	case "B":
-		return bytes.Equal(a.B, b.B)
-	case "BOOL":
-		return *a.BOOL == *b.BOOL
-	case "NULL":
-		return *a.NULL == *b.NULL
-	case "SS":
-		return sameStringSet(a.SS, b.SS, identityCanon)
-	case "NS":
-		return sameStringSet(a.NS, b.NS, canonicalNumber)
-	case "BS":
-		return sameBytesSet(a.BS, b.BS)
-	case "M":
-		if len(a.M) != len(b.M) {
-			return false
+		return map[string]any{"L": out}
+	case []string:
+		return map[string]any{"SS": t}
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, vv := range t {
+			m[k] = deleteItemToAV(vv)
 		}
-		for k, av := range a.M {
-			bv, ok := b.M[k]
-			if !ok || !attrEqual(av, bv) {
-				return false
+		return map[string]any{"M": m}
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() == reflect.String {
+			m := make(map[string]any, rv.Len())
+			iter := rv.MapRange()
+			for iter.Next() {
+				m[iter.Key().String()] = deleteItemToAV(iter.Value().Interface())
 			}
+			return map[string]any{"M": m}
 		}
-		return true
-	case "L":
-		if len(a.L) != len(b.L) {
-			return false
+	case reflect.Slice:
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = deleteItemToAV(rv.Index(i).Interface())
 		}
-		for i := range a.L {
-			if !attrEqual(a.L[i], b.L[i]) {
-				return false
-			}
-		}
-		return true
+		return map[string]any{"L": out}
 	}
-	return false
+	return map[string]any{"S": fmt.Sprintf("%v", v)}
 }
 
-func containsValue(hay, needle *AttributeValue) bool {
-	if hay == nil {
-		return false
+// deleteItemExposed returns a value referencing the same memory as v without
+// reflect's read-only flag, so fields reached through unexported struct fields
+// can be mutated. When v is not addressable it is returned unchanged.
+func deleteItemExposed(v reflect.Value) reflect.Value {
+	if !v.CanAddr() {
+		return v
 	}
-	switch attrKind(hay) {
-	case "S":
-		return attrKind(needle) == "S" && strings.Contains(*hay.S, *needle.S)
-	case "B":
-		return attrKind(needle) == "B" && bytes.Contains(hay.B, needle.B)
-	case "SS":
-		return attrKind(needle) == "S" && containsString(hay.SS, *needle.S, identityCanon)
-	case "NS":
-		return attrKind(needle) == "N" && containsString(hay.NS, *needle.N, canonicalNumber)
-	case "BS":
-		if attrKind(needle) != "B" {
-			return false
-		}
-		for _, b := range hay.BS {
-			if bytes.Equal(b, needle.B) {
-				return true
-			}
-		}
-		return false
-	case "L":
-		for _, e := range hay.L {
-			if attrEqual(e, needle) {
-				return true
-			}
-		}
-		return false
-	}
-	return false
-}
-
-func containsString(list []string, val string, canon func(string) (string, bool)) bool {
-	cv, ok := canon(val)
-	if !ok {
-		return false
-	}
-	for _, s := range list {
-		if cs, ok2 := canon(s); ok2 && cs == cv {
-			return true
-		}
-	}
-	return false
-}
-
-func canonicalSet(list []string, canon func(string) (string, bool)) ([]string, bool) {
-	out := make([]string, 0, len(list))
-	for _, s := range list {
-		c, ok := canon(s)
-		if !ok {
-			return nil, false
-		}
-		out = append(out, c)
-	}
-	sort.Strings(out)
-	return out, true
-}
-
-func sameStringSet(a, b []string, canon func(string) (string, bool)) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	ca, ok1 := canonicalSet(a, canon)
-	cb, ok2 := canonicalSet(b, canon)
-	if !ok1 || !ok2 {
-		return false
-	}
-	for i := range ca {
-		if ca[i] != cb[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func sameBytesSet(a, b [][]byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	sa := make([]string, 0, len(a))
-	for _, x := range a {
-		sa = append(sa, string(x))
-	}
-	sb := make([]string, 0, len(b))
-	for _, x := range b {
-		sb = append(sb, string(x))
-	}
-	sort.Strings(sa)
-	sort.Strings(sb)
-	for i := range sa {
-		if sa[i] != sb[i] {
-			return false
-		}
-	}
-	return true
+	return reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
 }
