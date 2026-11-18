@@ -1,86 +1,161 @@
 package s3
 
 import (
-	"encoding/hex"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"net"
 	"net/http"
 	"strings"
-
-	"github.com/LynnColeArt/flocigo/internal/errmap"
+	"time"
 )
 
-// requestID returns a short request identifier the way S3 headers carry it.
-func requestID() string { b := make([]byte, 8); rand.Read(b); return hex.EncodeToString(b) }
-
-func (s *Store) Router() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := requestID()
-		fail := func(e error) {
-			errmap.S3(e, reqID, reqID).Write(w)
-		}
-		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-		bucket, key := parts[0], ""
-		if len(parts) > 1 {
-			key = parts[1]
-		}
-		if key == "" {
-			switch r.Method {
-			case "PUT":
-				if e := s.CreateBucket(bucket); e != nil {
-					fail(errmap.New("InvalidBucketName",""))
-					return
-				}
-				w.Header().Set("Location", "/"+bucket)
-				w.WriteHeader(200)
-			case "DELETE":
-				if e := s.DeleteBucket(bucket); e != nil {
-					if e.Error() == "BucketNotEmpty" {
-						fail(errmap.New("BucketNotEmpty",""))
-						return
-					}
-					fail(errmap.New("NoSuchBucket",""))
-					return
-				}
-				w.WriteHeader(204)
-			case "GET":
-				objs := s.ListObjects(bucket, "")
-				w.Header().Set("Content-Type", "application/xml")
-				w.Write([]byte("<ListBucketResult>" + itoa(len(objs)) + "</ListBucketResult>"))
-			case "HEAD":
-				if !s.BucketExists(bucket) {
-					fail(errmap.New("NoSuchBucket",""))
-					return
-				}
-				w.WriteHeader(200)
-			default:
-				fail(errmap.New("NotImplemented",""))
-			}
-			return
-		}
-		switch r.Method {
-		case "PUT":
-			body := make([]byte, 4096)
-			n, _ := r.Body.Read(body)
-			etag, e := s.PutObject(bucket, key, body[:n])
-			if e != nil { fail(errmap.New("NoSuchBucket","")); return }
-			w.Header().Set("ETag", etag)
-			w.WriteHeader(200)
-		case "GET":
-			body, etag, e := s.GetObject(bucket, key)
-			if e != nil { fail(errmap.New("NoSuchKey","")); return }
-			w.Header().Set("ETag", etag)
-			w.Write(body)
-		case "HEAD":
-			_, etag, e := s.GetObject(bucket, key)
-			if e != nil { fail(errmap.New("NoSuchKey","")); return }
-			w.Header().Set("ETag", etag)
-		case "DELETE":
-			s.DeleteObject(bucket, key)
-			w.WriteHeader(204)
-		default:
-			fail(errmap.New("NotImplemented",""))
-		}
-	})
+// Router serves the S3 HTTP surface over one Store. It understands both
+// path-style (http://host/bucket/key) and virtual-hosted-style
+// (http://bucket.s3.<host>/key) addressing.
+type Router struct {
+	// Store backs every bucket and object; lazily created when nil.
+	Store *Store
+	// Region is reported by GetBucketLocation (default us-east-1).
+	Region string
+	// Presign plugs in credential resolution and signed-request notification.
+	Presign *PresignHooks
 }
 
-func itoa(n int) string { if n == 0 { return "0" }; s := ""; for n > 0 { s = string(rune('0'+n%10)) + s; n /= 10 }; return s }
+// Service is an alias kept for uniform service wiring across the emulator.
+type Service = Router
+
+// New returns a Router over an optional store.
+func New(store ...*Store) *Router { return newRouter(store) }
+
+// NewRouter is a synonym for New.
+func NewRouter(store ...*Store) *Router { return newRouter(store) }
+
+// NewHandler is a synonym for New.
+func NewHandler(store ...*Store) *Router { return newRouter(store) }
+
+// NewServer is a synonym for New.
+func NewServer(store ...*Store) *Router { return newRouter(store) }
+
+// NewService is a synonym for New.
+func NewService(store ...*Store) *Router { return newRouter(store) }
+
+func newRouter(store []*Store) *Router {
+	rt := &Router{}
+	if len(store) > 0 && store[0] != nil {
+		rt.Store = store[0]
+	}
+	return rt
+}
+
+// Handler returns rt as an http.Handler.
+func (rt *Router) Handler() http.Handler { return rt }
+
+func (rt *Router) store() *Store {
+	if rt.Store == nil {
+		rt.Store = NewStore()
+	}
+	return rt.Store
+}
+
+func (rt *Router) region() string {
+	if rt.Region == "" {
+		return DefaultRegion
+	}
+	return rt.Region
+}
+
+// splitTarget resolves the bucket/key pair for a request, honoring
+// virtual-host style Host headers before falling back to path style.
+func splitTarget(host, path string) (bucket, key string, hostStyle bool) {
+	h := host
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	h = strings.ToLower(strings.Trim(h, "[]"))
+	if i := strings.Index(h, ".s3."); i > 0 && len(h[i+4:]) > 0 {
+		return h[:i], strings.TrimPrefix(path, "/"), true
+	}
+	if rest, ok := strings.CutSuffix(h, ".localhost"); ok && rest != "" && rest != "s3" {
+		return rest, strings.TrimPrefix(path, "/"), true
+	}
+	rest := strings.TrimPrefix(path, "/")
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i], rest[i+1:], false
+	}
+	return rest, "", false
+}
+
+// ServeHTTP implements http.Handler.
+func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reqID := newRequestID()
+	h := w.Header()
+	h.Set("Server", "AmazonS3")
+	h.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	h.Set("x-amz-request-id", reqID)
+	h.Set("x-amz-id-2", newTraceID())
+
+	bucket, _, hostStyle := splitTarget(r.Host, r.URL.Path)
+	if e := rt.authorize(r, bucket, hostStyle); e != nil {
+		writeError(w, r, e)
+		return
+	}
+	_, key, _ := splitTarget(r.Host, r.URL.Path)
+	c := &reqCtx{rt: rt, w: w, r: r, bucket: bucket, key: key, hostStyle: hostStyle}
+	c.dispatch()
+}
+
+// reqCtx carries one request through the operation dispatch.
+type reqCtx struct {
+	rt        *Router
+	w         http.ResponseWriter
+	r         *http.Request
+	bucket    string
+	key       string
+	hostStyle bool
+}
+
+func (c *reqCtx) dispatch() {
+	switch {
+	case c.bucket == "":
+		c.rootOperation()
+	case c.key == "":
+		c.bucketLevel()
+	default:
+		c.objectLevel()
+	}
+}
+
+func (c *reqCtx) rootOperation() {
+	switch c.r.Method {
+	case http.MethodGet:
+		c.listBuckets()
+	case http.MethodHead:
+		writeEmpty(c.w, http.StatusOK)
+	default:
+		c.default405()
+	}
+}
+
+func (c *reqCtx) mustBucket() *s3Error {
+	if _, ok := c.rt.store().GetBucket(c.bucket); !ok {
+		return errNoSuchBucket()
+	}
+	return nil
+}
+
+func (c *reqCtx) default405() {
+	writeError(c.w, c.r, s3err(405, "MethodNotAllowed", "The specified method is not allowed against this resource."))
+}
+
+func newRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return strings.ToUpper(hex.EncodeToString(b))
+}
+
+func newTraceID() string {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
+}
