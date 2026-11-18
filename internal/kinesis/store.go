@@ -326,7 +326,7 @@ func decodeIterator(tok string) (iterToken, bool) {
 }
 
 // NewStore opens a Kinesis store under dataDir.
-func NewStore(dataDir string) *Store { return &Store{} }
+func NewStore(dataDir string) *Store { return newStore() }
 
 // validStreamName enforces the documented character set and length.
 func validStreamName(name string) bool {

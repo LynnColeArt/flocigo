@@ -15,6 +15,7 @@ import (
 	ddb "github.com/LynnColeArt/flocigo/internal/ddb"
 	"github.com/LynnColeArt/flocigo/internal/eventbridge"
 	"github.com/LynnColeArt/flocigo/internal/kinesis"
+	sfn "github.com/LynnColeArt/flocigo/internal/sfn"
 	"github.com/LynnColeArt/flocigo/internal/lambda"
 	"github.com/LynnColeArt/flocigo/internal/s3"
 	"github.com/LynnColeArt/flocigo/internal/s3vectors"
@@ -32,12 +33,14 @@ func main() {
 	ddbSvc := ddb.NewService(string(*data) + "/ddb/store.json")
 	ebSvc := eventbridge.NewService(string(*data) + "/eventbridge/store.json")
 	kinSvc := kinesis.NewService(*data)
+	sfnSvc := sfn.NewService(*data)
 
 	mux := http.NewServeMux()
 	mux.Handle("/2015-03-31/", lambdaSvc)   // Lambda API (in-process runner execution model)
 	mux.Handle("/ddb/", ddbSvc)             // DynamoDB awsjson1.0 surface
 	mux.Handle("/eventbridge/", ebSvc)      // EventBridge wire surface (awsjson 1.0)
 	mux.Handle("/kinesis/", kinSvc)         // Kinesis awsjson1.1 surface
+	mux.Handle("/sfn/", sfnSvc)             // Step Functions /2016-03-01 surface
 	mux.Handle("/sqs/", sqsServer)          // SQS query-protocol service
 	mux.Handle("/s3vectors/", vectorSvc)    // S3 Vectors (awsJson 1.0)
 	mux.Handle("/", store.Router())         // S3 REST/XML
@@ -49,6 +52,7 @@ func main() {
 		_ = lambdaSvc.Close()
 		_ = ddbSvc.Close()
 		_ = ebSvc.Close()
+		_ = sfnSvc.Close()
 	})
 	e := srv.ListenAndServe()
 	if e == http.ErrServerClosed {
