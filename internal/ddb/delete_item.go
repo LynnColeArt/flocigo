@@ -1,5 +1,9 @@
 package ddb
 
+import (
+	"net/http"
+)
+
 func (s *Service) deleteItem(w http.ResponseWriter, r *http.Request) {
 	out, aerr := s.doDeleteItem(r)
 	if aerr != nil {

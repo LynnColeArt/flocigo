@@ -34,11 +34,10 @@ const (
 )
 
 func (s *Service) lookupRule(bus, name string) *Rule {
-    r, ok := s.store.GetRule(bus, name)
-    if !ok {
-        return nil
-    }
-    return r
+    if r, ok := s.getRuleForBus(bus, name); ok {
+		return r
+	}
+	return nil
 }
 
 // busExists reports whether the named event bus exists; the default bus is
@@ -47,14 +46,21 @@ func (s *Service) busExists(name string) bool {
     if name == eventBusDefaultName {
         return true
     }
-    _, ok := s.store.GetBus(name)
+    _, ok := s.buses[name]
     return ok
 }
 
 // busRules returns the rules attached to a bus in a stable (name-sorted)
 // order so ingress matching is deterministic.
 func (s *Service) busRules(bus string) []*Rule {
-    rules := s.store.ListRules(bus)
+    var rules []*Rule
+	s.mu.Lock()
+	if rec, ok := s.buses[bus]; ok {
+		for _, rr := range rec.Rules {
+			rules = append(rules, &Rule{Name: rr.Name, Bus: bus, Description: rr.Description, State: rr.State, Schedule: rr.ScheduleExpression, PatternJSON: rr.EventPattern, Role: rr.RoleArn})
+		}
+	}
+	s.mu.Unlock()
     out := make([]*Rule, len(rules))
     copy(out, rules)
     sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -89,25 +95,6 @@ func ruleTargetARN(bus, rule string) string {
     return fmt.Sprintf("arn:aws:events:%s:%s:rule/%s/%s", ingressRegion, ingressAccountID, bus, rule)
 }
 
-// Target is an EventBridge rule target (model introduced by ticket 029; if
-// ticket 004 already declared it, keep that declaration and drop this one).
-type Target struct {
-    Arn                    string                  `json:"Arn"`
-    BatchParameters        *BatchParameters        `json:"BatchParameters,omitempty"`
-    DeadLetterConfig       *DeadLetterConfig       `json:"DeadLetterConfig,omitempty"`
-    EcsParameters          *EcsParameters          `json:"EcsParameters,omitempty"`
-    HttpParameters         *HttpParameters         `json:"HttpParameters,omitempty"`
-    Id                     string                  `json:"Id"`
-    Input                  string                  `json:"Input,omitempty"`
-    InputPath              string                  `json:"InputPath,omitempty"`
-    InputTransformer       *InputTransformer       `json:"InputTransformer,omitempty"`
-    KinesisParameters      *KinesisParameters      `json:"KinesisParameters,omitempty"`
-    RedshiftDataParameters *RedshiftDataParameters `json:"RedshiftDataParameters,omitempty"`
-    RetryPolicy            *RetryPolicy            `json:"RetryPolicy,omitempty"`
-    RoleArn                string                  `json:"RoleArn,omitempty"`
-    RunCommandParameters   *RunCommandParameters   `json:"RunCommandParameters,omitempty"`
-    SqsParameters          *SqsParameters          `json:"SqsParameters,omitempty"`
-}
 
 type TargetListEntry struct {
     ErrorCode    string `json:"ErrorCode"`
@@ -115,40 +102,12 @@ type TargetListEntry struct {
     TargetId     string `json:"TargetId"`
 }
 
-type InputTransformer struct {
-    InputPathsMap map[string]string `json:"InputPathsMap,omitempty"`
-    InputTemplate string            `json:"InputTemplate,omitempty"`
-}
 
-type SqsParameters struct {
-    MessageGroupId string `json:"MessageGroupId,omitempty"`
-}
 
-type KinesisParameters struct {
-    PartitionKeyPath string `json:"PartitionKeyPath,omitempty"`
-}
 
-type RetryPolicy struct {
-    MaximumEventAgeInSeconds int64 `json:"MaximumEventAgeInSeconds,omitempty"`
-    MaximumRetryAttempts     int64 `json:"MaximumRetryAttempts,omitempty"`
-}
 
-type DeadLetterConfig struct {
-    Arn string `json:"Arn,omitempty"`
-}
 
-type HttpParameters struct {
-    HeaderParameters      map[string]string `json:"HeaderParameters,omitempty"`
-    PathParameterValues   []string          `json:"PathParameterValues,omitempty"`
-    QueryStringParameters map[string]string `json:"QueryStringParameters,omitempty"`
-}
 
-type BatchParameters struct {
-    ArrayProperties *BatchArrayProperties `json:"ArrayProperties,omitempty"`
-    JobDefinition   string                `json:"JobDefinition,omitempty"`
-    JobName         string                `json:"JobName,omitempty"`
-    RetryStrategy   *BatchRetryStrategy   `json:"RetryStrategy,omitempty"`
-}
 
 type BatchArrayProperties struct {
     Size int64 `json:"Size,omitempty"`
@@ -158,13 +117,6 @@ type BatchRetryStrategy struct {
     Attempts int64 `json:"Attempts,omitempty"`
 }
 
-type EcsParameters struct {
-    Group                string                `json:"Group,omitempty"`
-    LaunchType           string                `json:"LaunchType,omitempty"`
-    NetworkConfiguration *NetworkConfiguration `json:"NetworkConfiguration,omitempty"`
-    TaskCount            int64                 `json:"TaskCount,omitempty"`
-    TaskDefinitionArn    string                `json:"TaskDefinitionArn,omitempty"`
-}
 
 type NetworkConfiguration struct {
     AwsvpcConfiguration *AwsvpcConfiguration `json:"AwsvpcConfiguration,omitempty"`
@@ -176,23 +128,8 @@ type AwsvpcConfiguration struct {
     Subnets        []string `json:"Subnets,omitempty"`
 }
 
-type RunCommandParameters struct {
-    RunCommandTargets []*RunCommandTarget `json:"RunCommandTargets,omitempty"`
-}
 
-type RunCommandTarget struct {
-    Key    string   `json:"Key,omitempty"`
-    Values []string `json:"Values,omitempty"`
-}
 
-type RedshiftDataParameters struct {
-    Database       string `json:"Database,omitempty"`
-    SecretArn      string `json:"SecretArn,omitempty"`
-    Sql            string `json:"Sql,omitempty"`
-    StatementName  string `json:"StatementName,omitempty"`
-    WithEvent      bool   `json:"WithEvent,omitempty"`
-    WorkgroupName  string `json:"WorkgroupName,omitempty"`
-}
 
 // targetTable stores per-rule targets keyed by bus + rule (separated by a
 // NUL byte), preserving insertion order (ListTargetsByRule order).
@@ -217,7 +154,7 @@ func (tt *targetTable) upsert(bus, rule string, t *Target) {
     key := targetTableKey(bus, rule)
     list := tt.byRule[key]
     for i, cur := range list {
-        if cur.Id == t.Id {
+        if cur.ID == t.ID {
             list[i] = t
             return
         }
@@ -245,7 +182,7 @@ func (tt *targetTable) remove(bus, rule, id string) bool {
     key := targetTableKey(bus, rule)
     list := tt.byRule[key]
     for i, cur := range list {
-        if cur.Id == id {
+        if cur.ID == id {
             tt.byRule[key] = append(list[:i:i], list[i+1:]...)
             return true
         }
@@ -277,11 +214,11 @@ func validateTargetEntry(t *Target) (string, string) {
     if t == nil {
         return ebCodeInvalidParameter, "Target must not be null."
     }
-    if !targetIDPattern.MatchString(t.Id) {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter Id is invalid."
+    if !targetIDPattern.MatchString(t.ID) {
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter Id is invalid."
     }
-    if !strings.HasPrefix(t.Arn, "arn:") {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter Arn is invalid."
+    if !strings.HasPrefix(t.ARN, "arn:") {
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter Arn is invalid."
     }
     forms := 0
     if t.Input != "" {
@@ -294,42 +231,42 @@ func validateTargetEntry(t *Target) (string, string) {
         forms++
     }
     if forms > 1 {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: only one of Input, InputPath or InputTransformer may be set."
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: only one of Input, InputPath or InputTransformer may be set."
     }
     if t.Input != "" && !json.Valid([]byte(t.Input)) {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter Input must be valid JSON."
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter Input must be valid JSON."
     }
     if t.InputPath != "" && !inputPathPattern.MatchString(t.InputPath) {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter InputPath is invalid."
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter InputPath is invalid."
     }
     if it := t.InputTransformer; it != nil {
         if it.InputTemplate == "" {
-            return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter InputTemplate is required."
+            return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter InputTemplate is required."
         }
         for _, p := range it.InputPathsMap {
             if !inputPathPattern.MatchString(p) {
-                return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter InputPathsMap is invalid."
+                return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter InputPathsMap is invalid."
             }
         }
         for _, ph := range templatePlaceholders(it.InputTemplate) {
             if _, ok := it.InputPathsMap[ph]; !ok {
-                return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter InputTemplate has an unresolvable placeholder <" + ph + ">."
+                return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter InputTemplate has an unresolvable placeholder <" + ph + ">."
             }
         }
     }
     if k := t.KinesisParameters; k != nil && k.PartitionKeyPath != "" && !inputPathPattern.MatchString(k.PartitionKeyPath) {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter PartitionKeyPath is invalid."
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter PartitionKeyPath is invalid."
     }
     if rp := t.RetryPolicy; rp != nil {
         if rp.MaximumEventAgeInSeconds != 0 && (rp.MaximumEventAgeInSeconds < 60 || rp.MaximumEventAgeInSeconds > 86400) {
-            return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter MaximumEventAgeInSeconds is invalid."
+            return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter MaximumEventAgeInSeconds is invalid."
         }
         if rp.MaximumRetryAttempts < 0 || rp.MaximumRetryAttempts > 185 {
-            return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter MaximumRetryAttempts is invalid."
+            return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter MaximumRetryAttempts is invalid."
         }
     }
     if dlc := t.DeadLetterConfig; dlc != nil && dlc.Arn != "" && !strings.HasPrefix(dlc.Arn, "arn:") {
-        return ebCodeInvalidParameter, "Target " + t.Id + " is not valid: parameter DeadLetterConfig.Arn is invalid."
+        return ebCodeInvalidParameter, "Target " + t.ID + " is not valid: parameter DeadLetterConfig.Arn is invalid."
     }
     return "", ""
 }
@@ -345,3 +282,30 @@ func templatePlaceholders(template string) []string {
     }
     return out
 }
+
+// lookupRule is the Service-side accessor that routes a (bus, rule) pair
+// through the kernel's buses map, adapting to the *Rule shape ticket 029
+// expects.
+func (s *Service) getRuleForBus(bus, name string) (*Rule, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.buses[bus]
+	if !ok {
+		return nil, false
+	}
+	rr, ok := rec.Rules[name]
+	if !ok {
+		return nil, false
+	}
+	return &Rule{
+		Name:        rr.Name,
+		Bus:         bus,
+		Description: rr.Description,
+		State:       rr.State,
+		Schedule:    rr.ScheduleExpression,
+		PatternJSON: rr.EventPattern,
+		Role:        rr.RoleArn,
+	}, true
+}
+
+

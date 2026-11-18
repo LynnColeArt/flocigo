@@ -126,7 +126,7 @@ func (s *Service) transactGetItems(in *TransactGetItemsInput) (*TransactGetItems
 		}
 		seen[fingerprint] = struct{}{}
 
-		got, err := s.getItem(&GetItemInput{
+		got, err := s.typedGetItem(&GetItemInput{
 			TableName:                g.TableName,
 			Key:                      g.Key,
 			ProjectionExpression:     g.ProjectionExpression,
@@ -139,7 +139,7 @@ func (s *Service) transactGetItems(in *TransactGetItemsInput) (*TransactGetItems
 
 		slot := ItemResponse{}
 		if got != nil {
-			slot.Item = got.Item
+			slot.Item = got
 		}
 		out.Responses = append(out.Responses, slot)
 	}

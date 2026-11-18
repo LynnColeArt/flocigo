@@ -1,5 +1,9 @@
 package ddb
 
+import (
+	"net/http"
+)
+
 type eskKey struct {
 	pk map[string]any
 	sk map[string]any
@@ -152,7 +156,7 @@ func (s *Service) doQuery(r *http.Request) (map[string]any, *apiErr) {
 		if !ok2 || n <= 0 {
 			return nil, ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'limit' failed to satisfy constraint: Member must have value greater than 0", reqValueString(v))
 		}
-		limit = n
+		limit = int64(n)
 	}
 
 	forward := true
@@ -186,14 +190,14 @@ func (s *Service) doQuery(r *http.Request) (map[string]any, *apiErr) {
 
 	items := []map[string]any{}
 	count := 0
-	scanned := 0
+	scanned := int64(0)
 	var lastItem map[string]any
 	haveLEK := false
 	for i, e := range entries {
 		if !matcher.match(e) {
 			continue
 		}
-		scanned++
+		scanned = scanned + 1
 		keep := true
 		if filter != nil {
 			keep, aerr = filter.eval(e.item)

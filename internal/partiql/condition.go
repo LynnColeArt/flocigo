@@ -633,7 +633,7 @@ func setElemType(setKind string) string {
 }
 
 func evalAttrType(x cndAttrType, ctx *evalCtx) (bool, error) {
-	lk, lv, lok, err := resolveOperand(x.L, ctx)
+	lk, _, lok, err := resolveOperand(x.L, ctx)
 	if err != nil {
 		return false, err
 	}

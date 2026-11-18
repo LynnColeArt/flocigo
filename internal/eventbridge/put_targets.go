@@ -36,7 +36,7 @@ func (s *Service) PutTargets(in *PutTargetsInput) (*PutTargetsOutput, error) {
     existing := tt.list(bus, in.Rule)
     existingIDs := make(map[string]struct{}, len(existing))
     for _, cur := range existing {
-        existingIDs[cur.Id] = struct{}{}
+        existingIDs[cur.ID] = struct{}{}
     }
 
     out := &PutTargetsOutput{FailedEntries: []*TargetListEntry{}}
@@ -47,7 +47,7 @@ func (s *Service) PutTargets(in *PutTargetsInput) (*PutTargetsOutput, error) {
     for _, t := range in.Targets {
         var id string
         if t != nil {
-            id = t.Id
+            id = t.ID
         }
         if code, msg := validateTargetEntry(t); code != "" {
             out.FailedEntries = append(out.FailedEntries, &TargetListEntry{
@@ -57,12 +57,12 @@ func (s *Service) PutTargets(in *PutTargetsInput) (*PutTargetsOutput, error) {
             })
             continue
         }
-        if _, dup := seen[t.Id]; dup {
+        if _, dup := seen[t.ID]; dup {
             continue // a repeated Id within one call is processed once
         }
-        seen[t.Id] = struct{}{}
-        if _, known := existingIDs[t.Id]; !known {
-            newIDs[t.Id] = struct{}{}
+        seen[t.ID] = struct{}{}
+        if _, known := existingIDs[t.ID]; !known {
+            newIDs[t.ID] = struct{}{}
         }
         accepted = append(accepted, t)
     }

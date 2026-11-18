@@ -13,19 +13,19 @@ import (
 //
 // It reports whether the key existed. Deleting a missing key — or a key in
 // a bucket that does not exist — is not an error.
-func (st *Store) DeleteObject(bucket, key string) bool {
+func (st *Store) DeleteObject(bucket, key string) (bool, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
 	b, ok := st.buckets[bucket]
 	if !ok {
-		return false
+		return false, nil
 	}
 	if _, ok := b.objects[key]; !ok {
-		return false
+		return false, nil
 	}
 	delete(b.objects, key)
-	return true
+	return true, nil
 }
 
 // handleDeleteObject serves DELETE /{bucket}/{key}.
@@ -43,7 +43,7 @@ func (st *Store) DeleteObject(bucket, key string) bool {
 func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	_ = r // method is fixed by the router; the path vars carry bucket and key
 
-	s.st.DeleteObject(bucket, key)
+	s.store.DeleteObject(bucket, key)
 
 	w.WriteHeader(http.StatusNoContent)
 }

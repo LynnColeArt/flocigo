@@ -7,6 +7,7 @@ package eventbridge
 // best-effort: endpoint failures never fail the PutEvents call.
 
 import (
+	"sync"
     "bytes"
     "encoding/json"
     "encoding/xml"
@@ -24,9 +25,8 @@ var ingressHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
 // ingressBaseURLs records, per Service, the address requests arrive on so
 // target delivery can reach the SQS surface of the same floci process.
-var ingressBaseURLs sync_Map_placeholder
+var ingressBaseURLs sync.Map
 
-func init() { ingressBaseURLs = sync.Map{} }
 
 // rememberIngressBase records the request's host for later deliveries.
 func (s *Service) rememberIngressBase(r *http.Request) {
@@ -53,7 +53,7 @@ func (s *Service) ingressEndpoint() string {
 
 // deliverIngressTarget resolves the target input for an event and sends it.
 func (s *Service) deliverIngressTarget(t *Target, env map[string]any, envJSON []byte) {
-    if t == nil || t.Arn == "" {
+    if t == nil || t.ARN == "" {
         return
     }
     body, contentType, ok := resolveIngressInput(t, env, envJSON)
@@ -61,10 +61,10 @@ func (s *Service) deliverIngressTarget(t *Target, env map[string]any, envJSON []
         return
     }
     switch {
-    case strings.HasPrefix(t.Arn, "arn:aws:sqs:"):
+    case strings.HasPrefix(t.ARN, "arn:aws:sqs:"):
         s.deliverIngressToSQS(t, body)
-    case strings.HasPrefix(t.Arn, "http://"), strings.HasPrefix(t.Arn, "https://"):
-        deliverIngressToHTTP(t.Arn, body, contentType, t.HttpParameters)
+    case strings.HasPrefix(t.ARN, "http://"), strings.HasPrefix(t.ARN, "https://"):
+        deliverIngressToHTTP(t.ARN, body, contentType, t.HttpParameters)
     }
 }
 
@@ -228,11 +228,11 @@ func (s *Service) ingressGetQueueURL(arn string) (string, bool) {
 // deliverIngressToSQS posts an SQS SendMessage whose body is the resolved
 // target input.
 func (s *Service) deliverIngressToSQS(t *Target, body []byte) {
-    queueURL := s.ingressFallbackQueueURL(t.Arn)
+    queueURL := s.ingressFallbackQueueURL(t.ARN)
     if queueURL == "" {
         return
     }
-    if resolved, ok := s.ingressGetQueueURL(t.Arn); ok {
+    if resolved, ok := s.ingressGetQueueURL(t.ARN); ok {
         queueURL = resolved
     }
     form := url.Values{}
@@ -240,8 +240,8 @@ func (s *Service) deliverIngressToSQS(t *Target, body []byte) {
     form.Set("Version", "2012-11-05")
     form.Set("QueueUrl", queueURL)
     form.Set("MessageBody", string(body))
-    if t.SqsParameters != nil && t.SqsParameters.MessageGroupId != "" {
-        form.Set("MessageGroupId", t.SqsParameters.MessageGroupId)
+    if t.SqsParameters != nil && t.SqsParameters.MessageGroupID != "" {
+        form.Set("MessageGroupId", t.SqsParameters.MessageGroupID)
     }
     _, _ = ingressHTTPClient.PostForm(queueURL, form)
 }

@@ -3,12 +3,11 @@ package sqs
 import (
 	"crypto/md5"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"os"
 	"sort"
 	"strconv"
@@ -38,11 +37,6 @@ var (
 // MessageAttributeValue holds one SQS message attribute: a transport data
 // type ("String", "Number" or "Binary", optionally with a custom label
 // suffix such as "Number.price") plus its transport value.
-type MessageAttributeValue struct {
-	DataType string // full declared type, e.g. "String" or "Number.price"
-	String   string // transport value for String and Number attributes
-	Binary   []byte // transport value for Binary attributes, base64-decoded
-}
 
 // SendMessageResult contains the fields SQS returns for SendMessage.
 type SendMessageResult struct {
@@ -175,32 +169,41 @@ func normalizeMessageAttributes(in map[string]MessageAttributeValue) (map[string
 	}
 	sort.Strings(names)
 
+
 	out := make(map[string]MessageAttributeValue, len(in))
 	digest := md5.New()
+	var lenbuf bytes.Buffer
 	for _, name := range names {
 		v := in[name]
 		transport := attributeTransportType(v.DataType)
 		var value []byte
 		switch transport {
 		case "String":
-			if !utf8.ValidString(v.String) {
-				return nil, "", fmt.Errorf("%w: %s: invalid UTF-8 value", errInvalidMessageAttribute, name)
+			if !utf8.ValidString(v.StringValue) {
+			return nil, "", fmt.Errorf("%w: %s: invalid UTF-8 value", errInvalidMessageAttribute, name)
 			}
-			value = []byte(v.String)
+			value = []byte(v.StringValue)
 		case "Number":
-			norm, err := normalizeAttributeNumber(v.String)
+			norm, err := normalizeAttributeNumber(v.StringValue)
 			if err != nil {
-				return nil, "", fmt.Errorf("%w: %s: %v", errInvalidMessageAttribute, name, err)
+			return nil, "", fmt.Errorf("%w: %s: %v", errInvalidMessageAttribute, name, err)
 			}
 			value = []byte(norm)
 		case "Binary":
-			value = v.Binary
+			value = v.BinaryValue
 		default:
 			return nil, "", fmt.Errorf("%w: %s: unsupported data type %q", errInvalidMessageAttribute, name, v.DataType)
 		}
-		digest = writeLenPrefixed(digest, []byte(name))
-		digest = writeLenPrefixed(digest, value)
-		digest = writeLenPrefixed(digest, []byte(transport))
+	
+			lenbuf.Reset()
+			writeLenPrefixed(&lenbuf, name)
+			digest.Write(lenbuf.Bytes())
+			lenbuf.Reset()
+			writeLenPrefixed(&lenbuf, string(value))
+			digest.Write(lenbuf.Bytes())
+			lenbuf.Reset()
+			writeLenPrefixed(&lenbuf, transport)
+			digest.Write(lenbuf.Bytes())
 		out[name] = v
 	}
 	return out, hex.EncodeToString(digest.Sum(nil)), nil
@@ -208,13 +211,6 @@ func normalizeMessageAttributes(in map[string]MessageAttributeValue) (map[string
 
 // writeLenPrefixed absorbs length-prefixed data into the digest and returns
 // w so calls can be chained.
-func writeLenPrefixed(w hash.Hash, data []byte) hash.Hash {
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(data)))
-	w.Write(length[:])
-	w.Write(data)
-	return w
-}
 
 // attributeTransportType strips a custom label suffix: "Number.price"
 // becomes "Number"; plain types are returned unchanged.

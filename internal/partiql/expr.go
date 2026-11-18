@@ -301,3 +301,17 @@ func (p *parser) parseProjection() ([]Path, error) {
 	}
 	return out, nil
 }
+
+// actionKw and condKw gate identifiers that are treated as keywords when
+// parsed in attribute-name position. Names that overlap the update-
+// expression grammar (SET/REMOVE/ADD/DELETE) or the condition-expression
+// grammar (AND/OR/NOT/IN/BETWEEN/IS/EXISTS/...) cannot be unquoted
+// identifiers, matching the AWS parser's token rule.
+var actionKw = map[string]bool{
+	updSet: true, updRemove: true, updAdd: true, updDelete: true,
+}
+var condKw = map[string]bool{
+	"and": true, "or": true, "not": true, "in": true, "between": true,
+	"is": true, "exists": true, "null": true, "begin_with": true,
+	"begins_with": true, "contains": true, "size": true, "attribute_type": true,
+}

@@ -1,5 +1,9 @@
 package ddb
 
+import (
+	"net/http"
+)
+
 func (s *Service) updateItem(w http.ResponseWriter, r *http.Request) {
 	out, aerr := s.doUpdateItem(r)
 	if aerr != nil {

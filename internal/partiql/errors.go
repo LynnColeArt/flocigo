@@ -51,7 +51,7 @@ func verr(code, format string, args ...interface{}) *ValidationError {
 }
 
 func invalidf(kind ExprKind, format string, args ...interface{}) *ValidationError {
-	return verr(CodeValidation, "Invalid "+string(kind)+": "+fmt.Sprintf(format, args...))
+	return verr(CodeValidation, "Invalid %s: %s", string(kind), fmt.Sprintf(format, args...))
 }
 
 // syntaxErr reproduces the ANTLR-style grammar failure of the Java parsers.

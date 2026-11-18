@@ -193,7 +193,7 @@ func (c *reqCtx) subresourceMissing(code, message string) {
 		writeError(c.w, c.r, e)
 		return
 	}
-	writeError(c.w, c.r, s3err(404, code, message))
+	writeError(c.w, c.r, s3err(404, code, "%s", message))
 }
 
 // bucketLocation answers GET /bucket?location.

@@ -1900,7 +1900,7 @@ func applyUpdateOps(item map[string]any, ops []updOp, t *Table) ([]updOp, *apiEr
 					return nil, aerr
 				}
 				existing, has := item[op.root]
-				newVal, aerr := addUpdateValues(existing, has, val)
+				newVal, aerr := addUpdateValues(existing.(map[string]any), has, val)
 				if aerr != nil {
 					return nil, aerr
 				}
@@ -1923,7 +1923,7 @@ func applyUpdateOps(item map[string]any, ops []updOp, t *Table) ([]updOp, *apiEr
 					touched = append(touched, op)
 					continue
 				}
-				newVal, aerr := deleteUpdateValues(existing, val)
+				newVal, aerr := deleteUpdateValues(existing.(map[string]any), val)
 				if aerr != nil {
 					return nil, aerr
 				}

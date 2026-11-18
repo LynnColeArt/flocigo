@@ -168,7 +168,7 @@ func (s *Service) matchAndDeliver(bus string, env map[string]any, envJSON []byte
         if !ruleStateEnabled(rule) {
             continue
         }
-        filter, err := compileEventFilter(rule.EventPattern)
+        filter, err := compileEventFilter(rule.PatternJSON)
         if err != nil {
             continue // malformed patterns never match
         }

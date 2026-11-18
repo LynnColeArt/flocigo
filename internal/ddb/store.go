@@ -81,9 +81,9 @@ func keyIDOf(a map[string]any) string {
 
 // storageKeyFor computes the storage key of an item for the base table.
 func storageKeyFor(pk, sk string, item map[string]any) string {
-	id := keyIDOf(item[pk])
+	id := keyIDOf(item[pk].(map[string]any))
 	if sk != "" {
-		id += "\x00" + keyIDOf(item[sk])
+		id += "\x00" + keyIDOf(item[sk].(map[string]any))
 	}
 	return id
 }
@@ -95,13 +95,13 @@ func indexStorageKey(idx *IndexDef, item map[string]any) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	id := keyIDOf(pkv)
+	id := keyIDOf(pkv.(map[string]any))
 	if idx.SK != "" {
 		skv, ok2 := item[idx.SK]
 		if !ok2 {
 			return "", false
 		}
-		id += "\x00" + keyIDOf(skv)
+		id += "\x00" + keyIDOf(skv.(map[string]any))
 	}
 	return id, true
 }
@@ -203,12 +203,12 @@ func (t *Table) partitionEntries(idxName string, pk map[string]any) []entry {
 	pkID := keyIDOf(pk)
 	out := make([]entry, 0, 8)
 	for _, item := range src {
-		if keyIDOf(item[ipk]) != pkID {
+		if keyIDOf(item[ipk].(map[string]any)) != pkID {
 			continue
 		}
-		e := entry{pk: item[ipk], item: item}
+		e := entry{pk: item[ipk].(map[string]any), item: item}
 		if isk != "" {
-			e.sk = item[isk]
+			e.sk = item[isk].(map[string]any)
 		}
 		out = append(out, e)
 	}

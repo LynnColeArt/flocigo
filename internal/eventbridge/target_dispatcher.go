@@ -46,11 +46,22 @@ const (
 // lambda functions are addressed by ARN, HTTP endpoints by URL; Input
 // optionally replaces the event with a constant JSON document.
 type Target struct {
-	ID    string
-	ARN   string
-	URL   string
-	Role  string
-	Input string
+	ID                     string                  `json:"Id"`
+	ARN                    string                  `json:"Arn"`
+	URL                    string                  `json:"-"`
+	Role                   string                  `json:"RoleArn,omitempty"`
+	Input                  string                  `json:"Input,omitempty"`
+	InputPath              string                  `json:"InputPath,omitempty"`
+	InputTransformer       *InputTransformer       `json:"InputTransformer,omitempty"`
+	HttpParameters         *HttpParameters         `json:"HttpParameters,omitempty"`
+	SqsParameters          *SqsParameters          `json:"SqsParameters,omitempty"`
+	KinesisParameters      *KinesisParameters      `json:"KinesisParameters,omitempty"`
+	EcsParameters          *EcsParameters          `json:"EcsParameters,omitempty"`
+	BatchParameters        *BatchParameters        `json:"BatchParameters,omitempty"`
+	RedshiftDataParameters *RedshiftDataParameters `json:"RedshiftDataParameters,omitempty"`
+	RunCommandParameters   *RunCommandParameters   `json:"RunCommandParameters,omitempty"`
+	RetryPolicy            *RetryPolicy            `json:"RetryPolicy,omitempty"`
+	DeadLetterConfig       *DeadLetterConfig       `json:"DeadLetterConfig,omitempty"`
 }
 
 // Kind reports which route the target uses. A URL wins when both a URL
@@ -214,7 +225,7 @@ func (d *TargetDispatcher) dispatchSQS(ctx context.Context, event map[string]any
 		res.Err = err
 		return res
 	}
-	messageID, err := d.Queues.SendMessage(ctx, t.ARN, body, nil)
+	messageID, err := d.Queues.SendMessage(ctx, t.ARN, string(body), nil)
 	if err != nil {
 		res.Err = fmt.Errorf("sqs send to %s: %w", t.ARN, err)
 		return res
@@ -314,4 +325,73 @@ func (d *TargetDispatcher) finish(res DispatchResult) DispatchResult {
 		d.logger().Printf("eventbridge: dispatch to target %q (%s) failed: %v", res.TargetID, res.Kind, res.Err)
 	}
 	return res
+}
+
+// BatchParameters etc are the parameter bag types ticket 029's target wire
+// surface expects; they are carried through the dispatcher as opaque values
+// so the kernel-level Target type stays minimal while the API layer can
+// model the full AWS shape.
+type BatchParameters struct {
+	BurstMaxConcurrency int `json:"BurstMaxConcurrency,omitempty"`
+	JobRetryStrategy    int `json:"JobRetryStrategy,omitempty"`
+}
+type DeadLetterConfig struct {
+	Arn string `json:"Arn"`
+}
+type EcsParameters struct {
+	TaskCount       int    `json:"TaskCount,omitempty"`
+	TaskDefinition  string `json:"TaskDefinition,omitempty"`
+	LaunchType      string `json:"LaunchType,omitempty"`
+	NetworkConfigID string `json:"NetworkConfiguration,omitempty"`
+}
+type HttpParameters struct {
+	PathParameterValues    map[string]string  `json:"PathParameterValues,omitempty"`
+	HeaderParameters       map[string]string  `json:"HeaderParameters,omitempty"`
+	QueryStringParameters  map[string]string  `json:"QueryStringParameters,omitempty"`
+}
+type InputTransformer struct {
+	InputPathsMap map[string]string `json:"InputPathsMap,omitempty"`
+	InputTemplate string            `json:"InputTemplate,omitempty"`
+}
+type KinesisParameters struct {
+	PartitionKeyPath string `json:"PartitionKeyPath,omitempty"`
+}
+type RedshiftDataParameters struct {
+	Database  string `json:"Database"`
+	Sqls      string `json:"Sqls"`
+	SecretArn string `json:"SecretArn,omitempty"`
+}
+type RetryPolicy struct {
+	MaximumRetryAttempts       int `json:"MaximumRetryAttempts,omitempty"`
+	MaximumEventAgeInSeconds   int `json:"MaximumEventAgeInSeconds,omitempty"`
+}
+type RunCommandParameters struct {
+	RunCommandTargets []RunCommandTarget `json:"RunCommandTargets,omitempty"`
+}
+type RunCommandTarget struct {
+	Key   string   `json:"Key"`
+	Values []string `json:"Values"`
+}
+type SqsParameters struct {
+	QueueLength int `json:"QueueLength,omitempty"`
+	MessageGroupID string `json:"MessageGroupId,omitempty"`
+}
+
+// These were redeclared by ticket 029; extend the kernel Target with the
+// optional wire members so both the dispatcher and the API layer compile
+// against the same type.
+func init() { _ = Target{} }
+
+// Rule is one EventBridge rule: its pattern, schedule, enablement and the
+// targets PutTargets registers against it. Introduced by ticket 029; the
+// dispatcher works on the plain name and the store keeps the full record.
+type Rule struct {
+	Name            string          `json:"Name"`
+	Bus             string          `json:"EventBusName"`
+	Description     string          `json:"Description,omitempty"`
+	State           string          `json:"State,omitempty"`
+	Schedule        string          `json:"ScheduleExpression,omitempty"`
+	PatternJSON     string          `json:"EventPattern,omitempty"`
+	Role            string          `json:"RoleArn,omitempty"`
+	Targets         []*Target       `json:"Targets,omitempty"`
 }

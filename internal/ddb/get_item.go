@@ -1,5 +1,9 @@
 package ddb
 
+import (
+	"net/http"
+)
+
 func (s *Service) getItem(w http.ResponseWriter, r *http.Request) {
 	out, aerr := s.doGetItem(r)
 	if aerr != nil {

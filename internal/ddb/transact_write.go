@@ -1017,7 +1017,7 @@ func (p *txnCondParser) parsePath() ([]txnPathSeg, bool) {
       if !ok2 {
         return nil, false
       }
-      idx, err := strconv.Atoi(it.text)
+      idx, err := strconv.Atoi(it)
       if err != nil {
         return nil, false
       }

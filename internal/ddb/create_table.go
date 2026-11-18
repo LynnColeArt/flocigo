@@ -2,6 +2,7 @@ package ddb
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -71,8 +72,9 @@ func (s *Service) doCreateTable(r *http.Request) (map[string]any, *apiErr) {
 	}
 	rcu, wcu := int64(0), int64(0)
 	if ptm, ok := reqMapValue(req, "ProvisionedThroughput"); ok {
-		rcu, _ = reqIntValue(ptm, "ReadCapacityUnits")
-		wcu, _ = reqIntValue(ptm, "WriteCapacityUnits")
+		_v1, _ := reqIntValue(ptm, "ReadCapacityUnits")
+		_w, _ := reqIntValue(ptm, "WriteCapacityUnits")
+		rcu, wcu = int64(_v1), int64(_w)
 	}
 	if billing == "PAY_PER_REQUEST" && (rcu > 0 || wcu > 0) {
 		return nil, ddbError("ValidationException", "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST")
@@ -156,8 +158,10 @@ func (s *Service) doCreateTable(r *http.Request) (map[string]any, *apiErr) {
 		}
 		ircu, iwcu := rcu, wcu
 		if ptm, ok := reqMapValue(m, "ProvisionedThroughput"); ok {
-			ircu, _ = reqIntValue(ptm, "ReadCapacityUnits")
-			iwcu, _ = reqIntValue(ptm, "WriteCapacityUnits")
+			_v2, _ := reqIntValue(ptm, "ReadCapacityUnits")
+			ircu = int64(_v2)
+			_v3, _ := reqIntValue(ptm, "WriteCapacityUnits")
+			iwcu = int64(_v3)
 		}
 		table.GSIs[name] = &IndexDef{Name: name, PK: ipk, SK: isk, ProjType: projType, ProjAttrs: projAttrs}
 		gd := map[string]any{

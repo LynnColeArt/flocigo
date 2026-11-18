@@ -269,28 +269,6 @@ func (q *Queue) Receive(maxSize int, visibility, wait time.Duration) []*Delivery
 // delete is best effort: well-formed handles whose checkout is stale (or
 // unknown) succeed idempotently, garbage handles yield
 // ErrMalformedReceiptHandle.
-func (q *Queue) DeleteMessage(receipt string) error {
-    data, ok := decodeReceiptHandle(receipt)
-    if !ok {
-        return ErrMalformedReceiptHandle
-    }
-    q.mu.Lock()
-    defer q.mu.Unlock()
-    for _, m := range q.messages {
-        if m.MessageID != data.MessageID || m.deleted {
-            continue
-        }
-        if m.ReceiptHandle == receipt {
-            m.deleted = true
-            if m.revealTimer != nil {
-                m.revealTimer.Stop()
-            }
-            q.compactLocked()
-        }
-        return nil
-    }
-    return nil
-}
 
 // takeVisibleLocked pops up to maxSize visible messages, checks each out and
 // returns immutable snapshots. The caller holds q.mu.

@@ -26,7 +26,7 @@ func main() {
 		wd, _ := os.Getwd()
 		*data = wd + "/floci-go-data"
 	}
-	store := s3.NewStore(*data)
+	store := s3.NewStoreAt(*data)
 	lambdaSvc := lambda.NewService()
 	sqsServer := sqs.NewServer(sqs.NewManager())
 	vectorSvc := s3vectors.NewService()

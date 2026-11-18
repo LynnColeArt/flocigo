@@ -242,24 +242,6 @@ func (s *Store) GetObject(bucket, key string) (*Object, error) {
 	return o, nil
 }
 
-// DeleteObject removes bucket/key. Deleting an absent key is a no-op, as in S3.
-func (s *Store) DeleteObject(bucket, key string) (bool, error) {
-	s.mu.Lock()
-	b, ok := s.buckets[bucket]
-	if !ok {
-		s.mu.Unlock()
-		return false, errNoSuchBucket()
-	}
-	_, existed := b.objects[key]
-	delete(b.objects, key)
-	hook := s.OnObjectDelete
-	s.mu.Unlock()
-	if hook != nil {
-		hook(bucket, key)
-	}
-	return existed, nil
-}
-
 // ListObjects scans a bucket with the shared V1/V2 listing rules.
 func (s *Store) ListObjects(bucket, prefix, delimiter, marker string, maxKeys int) (*ListResult, error) {
 	s.mu.RLock()

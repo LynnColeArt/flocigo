@@ -704,7 +704,6 @@ func mergeSet(kind string, set AV, v AV) (AV, error) {
 // set would become empty (which DynamoDB rejects).
 func removeFromSet(kind string, set AV, v AV) (AV, error) {
 	se, _ := listElems(set[kind])
-	ve, _ := listElems(v[kind])
 	out := make([]any, 0, len(se))
 	for _, e := range se {
 		if !setContains(kind, v, e) {
