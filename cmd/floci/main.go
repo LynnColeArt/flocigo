@@ -14,6 +14,8 @@ import (
 
 	"github.com/LynnColeArt/flocigo/internal/lambda"
 	"github.com/LynnColeArt/flocigo/internal/s3"
+	"github.com/LynnColeArt/flocigo/internal/s3vectors"
+	"github.com/LynnColeArt/flocigo/internal/sqs"
 )
 
 func main() {
@@ -26,9 +28,14 @@ func main() {
 	}
 	store := s3.NewStore(*data)
 	lambdaSvc := lambda.NewService()
+	sqsServer := sqs.NewServer(sqs.NewManager())
+	vectorSvc := s3vectors.NewService()
+
 	mux := http.NewServeMux()
-	mux.Handle("/2015-03-31/", lambdaSvc) // Lambda API (in-process runner execution model)
-	mux.Handle("/", store.Router())
+	mux.Handle("/2015-03-31/", lambdaSvc)             // Lambda API (in-process runner execution model)
+	mux.Handle("/sqs/", sqsServer)                    // SQS query-protocol service
+	mux.Handle("/s3vectors/", vectorSvc)              // S3 Vectors (awsJson 1.0)
+	mux.Handle("/", store.Router())                   // S3 REST/XML
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	srv := &http.Server{Addr: *addr, Handler: mux, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
