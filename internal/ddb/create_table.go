@@ -1,422 +1,335 @@
 package ddb
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
-	"regexp"
-	"sort"
 	"strings"
+	"time"
 )
 
-// ---- CreateTable request members -------------------------------------------
-
-type provisionedThroughputIn struct {
-	ReadCapacityUnits  int64 `json:"ReadCapacityUnits"`
-	WriteCapacityUnits int64 `json:"WriteCapacityUnits"`
+type attrDef struct {
+	name, typ string
 }
 
-type projectionIn struct {
-	ProjectionType   string   `json:"ProjectionType"`
-	NonKeyAttributes []string `json:"NonKeyAttributes,omitempty"`
-}
-
-type globalSecondaryIndexIn struct {
-	IndexName             string                   `json:"IndexName"`
-	KeySchema             []KeySchemaElement       `json:"KeySchema"`
-	Projection            *projectionIn            `json:"Projection,omitempty"`
-	ProvisionedThroughput *provisionedThroughputIn `json:"ProvisionedThroughput,omitempty"`
-}
-
-type localSecondaryIndexIn struct {
-	IndexName  string             `json:"IndexName"`
-	KeySchema  []KeySchemaElement `json:"KeySchema"`
-	Projection *projectionIn      `json:"Projection,omitempty"`
-}
-
-type tagIn struct {
-	Key   string `json:"Key"`
-	Value string `json:"Value"`
-}
-
-// createTableRequest is the CreateTable_2012-08-10 request document.
-type createTableRequest struct {
-	TableName                 string                   `json:"TableName"`
-	AttributeDefinitions      []AttributeDefinition    `json:"AttributeDefinitions"`
-	KeySchema                 []KeySchemaElement       `json:"KeySchema"`
-	BillingMode               string                   `json:"BillingMode,omitempty"`
-	ProvisionedThroughput     *provisionedThroughputIn `json:"ProvisionedThroughput,omitempty"`
-	GlobalSecondaryIndexes    []globalSecondaryIndexIn `json:"GlobalSecondaryIndexes,omitempty"`
-	LocalSecondaryIndexes     []localSecondaryIndexIn  `json:"LocalSecondaryIndexes,omitempty"`
-	Tags                      []tagIn                  `json:"Tags,omitempty"`
-	TableClass                string                   `json:"TableClass,omitempty"`
-	DeletionProtectionEnabled bool                     `json:"DeletionProtectionEnabled"`
-}
-
-// ---- CreateTable response members (TableDescription) ------------------------
-
-type billingModeSummary struct {
-	BillingMode string `json:"BillingMode"`
-}
-
-type tableClassSummary struct {
-	TableClass string `json:"TableClass"`
-}
-
-type provisionedThroughputDesc struct {
-	NumberOfDecreasesToday int64 `json:"NumberOfDecreasesToday"`
-	ReadCapacityUnits      int64 `json:"ReadCapacityUnits"`
-	WriteCapacityUnits     int64 `json:"WriteCapacityUnits"`
-}
-
-type indexDescription struct {
-	IndexName             string                     `json:"IndexName"`
-	IndexArn              string                     `json:"IndexArn"`
-	IndexStatus           string                     `json:"IndexStatus,omitempty"`
-	IndexSizeBytes        int64                      `json:"IndexSizeBytes"`
-	ItemCount             int64                      `json:"ItemCount"`
-	KeySchema             []KeySchemaElement         `json:"KeySchema"`
-	Projection            *projectionIn              `json:"Projection,omitempty"`
-	ProvisionedThroughput *provisionedThroughputDesc `json:"ProvisionedThroughput,omitempty"`
-}
-
-// tableDescription mirrors the DynamoDB TableDescription document.
-type tableDescription struct {
-	TableName                 string                     `json:"TableName"`
-	TableStatus               string                     `json:"TableStatus"`
-	CreationDateTime          float64                    `json:"CreationDateTime"`
-	TableArn                  string                     `json:"TableArn"`
-	TableId                   string                     `json:"TableId"`
-	AttributeDefinitions      []AttributeDefinition      `json:"AttributeDefinitions"`
-	KeySchema                 []KeySchemaElement         `json:"KeySchema"`
-	BillingModeSummary        *billingModeSummary        `json:"BillingModeSummary,omitempty"`
-	ProvisionedThroughput     *provisionedThroughputDesc `json:"ProvisionedThroughput"`
-	GlobalSecondaryIndexes    []indexDescription         `json:"GlobalSecondaryIndexes,omitempty"`
-	LocalSecondaryIndexes     []indexDescription         `json:"LocalSecondaryIndexes,omitempty"`
-	ItemCount                 int64                      `json:"ItemCount"`
-	TableSizeBytes            int64                      `json:"TableSizeBytes"`
-	DeletionProtectionEnabled bool                       `json:"DeletionProtectionEnabled"`
-	TableClassSummary         *tableClassSummary         `json:"TableClassSummary,omitempty"`
-}
-
-type createTableResponse struct {
-	TableDescription tableDescription `json:"TableDescription"`
-}
-
-// serveCreateTable implements CreateTable: validate + persist the pk/sk schema
-// in the store file, then answer with an ACTIVE TableDescription. A table name
-// that already exists is rejected with ResourceInUseException.
-func (s *TableService) serveCreateTable(w http.ResponseWriter, body []byte) {
-	var req createTableRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		ddbWriteError(w, &ddbError{Status: http.StatusBadRequest, Code: "SerializationException"})
+func (s *Service) createTable(w http.ResponseWriter, r *http.Request) {
+	out, aerr := s.doCreateTable(r)
+	if aerr != nil {
+		ddbWriteError(w, aerr)
 		return
 	}
-	table, apiErr := s.validateCreateTable(&req)
-	if apiErr != nil {
-		ddbWriteError(w, apiErr)
-		return
+	ddbWriteResult(w, out)
+}
+
+func (s *Service) doCreateTable(r *http.Request) (map[string]any, *apiErr) {
+	req, aerr := ddbDecodeRequest(r)
+	if aerr != nil {
+		return nil, aerr
 	}
-	created, err := s.store.CreateTable(table)
-	if err != nil {
-		if errors.Is(err, ErrResourceInUse) {
-			ddbWriteError(w, &ddbError{
-				Status:  http.StatusBadRequest,
-				Code:    "ResourceInUseException",
-				Message: "Table already exists: " + req.TableName,
-			})
-			return
+	tn := reqString(req, "TableName")
+	if tn == "" || len(tn) < 3 || len(tn) > 255 {
+		return nil, ddbError("ValidationException", msgBadTableName)
+	}
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+	if _, exists := s.store.tables[tn]; exists {
+		return nil, ddbErrorf("ResourceInUseException", "Table already exists: %s", tn)
+	}
+	attrDefs := map[string]string{}
+	var defs []attrDef
+	rawDefs, _ := reqListValue(req, "AttributeDefinitions")
+	for i, el := range rawDefs {
+		m, ok := el.(map[string]any)
+		if !ok {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: Invalid AttributeDefinition at position %d", i+1)
 		}
-		ddbWriteError(w, &ddbError{Status: http.StatusInternalServerError, Code: "InternalServerError", Message: err.Error()})
-		return
+		name := reqString(m, "AttributeName")
+		typ := reqString(m, "AttributeType")
+		if name == "" {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: AttributeName must be present at position %d", i+1)
+		}
+		if typ != "S" && typ != "N" && typ != "B" {
+			return nil, ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'attributeDefinitions.%d.member.attributeType' failed to satisfy constraint: Member must satisfy enum value set: [B, N, S]", typ, i+1)
+		}
+		if _, dup := attrDefs[name]; dup {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: Duplicate attribute name: %s", name)
+		}
+		attrDefs[name] = typ
+		defs = append(defs, attrDef{name, typ})
 	}
-	ddbWriteResponse(w, createTableResponse{TableDescription: *s.describeTable(created)})
-}
-
-// ddbTableNamePattern is the allowed table-name character set.
-var ddbTableNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
-
-// validateCreateTable applies the CreateTable constraints and materializes the
-// StoredTable record (pk/sk schema) to insert into the store file.
-func (s *TableService) validateCreateTable(req *createTableRequest) (*StoredTable, *ddbError) {
-	name := req.TableName
-	switch {
-	case name == "":
-		return nil, ddbErrValidation("1 validation error detected: Value null at 'tableName' failed to satisfy constraint: Member must not be null")
-	case len(name) < 3:
-		return nil, ddbErrValidation(fmt.Sprintf("1 validation error detected: Value '%s' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 3", name))
-	case len(name) > 255:
-		return nil, ddbErrValidation("1 validation error detected: Value at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255")
-	case !ddbTableNamePattern.MatchString(name):
-		return nil, ddbErrValidation("Special characters are not allowed in table names except '.' (period), '-' (hyphen) and '_' (underscore)")
+	pkTable, skTable, aerr := parseKeySchemaList(req["KeySchema"])
+	if aerr != nil {
+		return nil, aerr
 	}
-
-	billing := req.BillingMode
+	if aerr := checkKeyAttrsDefined(attrDefs, []string{pkTable, skTable}, tn); aerr != nil {
+		return nil, aerr
+	}
+	billing := reqString(req, "BillingMode")
 	if billing == "" {
-		billing = BillingModeProvisioned
+		billing = "PROVISIONED"
 	}
-	if billing != BillingModeProvisioned && billing != BillingModePayPerRequest {
-		return nil, ddbErrValidation(fmt.Sprintf("1 validation error detected: Value '%s' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]", billing))
+	if billing != "PROVISIONED" && billing != "PAY_PER_REQUEST" {
+		return nil, ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'billingMode' failed to satisfy constraint: Member must satisfy enum value set: [PAY_PER_REQUEST, PROVISIONED]", billing)
 	}
-
-	switch req.TableClass {
-	case "", "STANDARD", "STANDARD_INFREQUENT_ACCESS":
-	default:
-		return nil, ddbErrValidation(fmt.Sprintf("1 validation error detected: Value '%s' at 'tableClass' failed to satisfy constraint: Member must satisfy enum value set: [STANDARD, STANDARD_INFREQUENT_ACCESS]", req.TableClass))
+	rcu, wcu := int64(0), int64(0)
+	if ptm, ok := reqMapValue(req, "ProvisionedThroughput"); ok {
+		rcu, _ = reqIntValue(ptm, "ReadCapacityUnits")
+		wcu, _ = reqIntValue(ptm, "WriteCapacityUnits")
 	}
-
-	attrTypes := make(map[string]string, len(req.AttributeDefinitions))
-	for _, ad := range req.AttributeDefinitions {
-		if ad.AttributeName == "" {
-			return nil, ddbErrValidation("One or more parameter values were invalid: AttributeName cannot be empty in AttributeDefinitions")
-		}
-		switch ad.AttributeType {
-		case "S", "N", "B":
-		default:
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: AttributeType %s is not valid, must be one of: S, N, or B", ad.AttributeType))
-		}
-		if _, dup := attrTypes[ad.AttributeName]; dup {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Duplicate AttributeName: %s in AttributeDefinitions", ad.AttributeName))
-		}
-		attrTypes[ad.AttributeName] = ad.AttributeType
+	if billing == "PAY_PER_REQUEST" && (rcu > 0 || wcu > 0) {
+		return nil, ddbError("ValidationException", "One or more parameter values were invalid: Neither ReadCapacityUnits nor WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST")
 	}
-
-	if len(req.KeySchema) == 0 {
-		return nil, ddbErrValidation("One or more parameter values were invalid: The list of KeySchemaElements contains no elements")
+	table := &Table{
+		Name:        tn,
+		AttrDefs:    attrDefs,
+		PK:          pkTable,
+		SK:          skTable,
+		BillingMode: billing,
+		RCU:         rcu,
+		WCU:         wcu,
+		Items:       map[string]map[string]any{},
+		IndexItems:  map[string]map[string]map[string]any{},
+		GSIs:        map[string]*IndexDef{},
+		LSIs:        map[string]*IndexDef{},
+		TableID:     newUUID(),
+		Created:     nowFloat(),
 	}
-	if len(req.KeySchema) > 2 {
-		return nil, ddbErrValidation("One or more parameter values were invalid: Number of KeySchemaElements in KeySchema exceeds the limit of 2")
+	arn := fmt.Sprintf("arn:aws:dynamodb:us-east-1:000000000000:table/%s", tn)
+	desc := map[string]any{
+		"TableName":             tn,
+		"AttributeDefinitions":  attrDefDescs(defs),
+		"KeySchema":             keySchemaDesc(pkTable, skTable),
+		"ItemCount":             0,
+		"TableStatus":           "ACTIVE",
+		"CreationDateTime":      table.Created,
+		"TableArn":              arn,
+		"TableId":               table.TableID,
+		"ProvisionedThroughput": ptDesc(billing, rcu, wcu),
 	}
-	if req.KeySchema[0].KeyType != KeyTypeHash {
-		return nil, ddbErrValidation("Invalid KeySchema: The first KeySchemaElement is not a HASH key type")
+	if billing == "PAY_PER_REQUEST" {
+		desc["BillingModeSummary"] = map[string]any{"BillingMode": "PAY_PER_REQUEST"}
 	}
-	if req.KeySchema[0].AttributeName == "" {
-		return nil, ddbErrValidation("One or more parameter values were invalid: KeySchema AttributeName cannot be empty")
+	streamEnabled, streamViewType := false, ""
+	if ss, ok := reqMapValue(req, "StreamSpecification"); ok {
+		streamEnabled, _ = reqBoolValue(ss, "StreamEnabled")
+		streamViewType = reqString(ss, "StreamViewType")
+		if streamEnabled {
+			switch streamViewType {
+			case "KEYS_ONLY", "NEW_IMAGE", "OLD_IMAGE", "NEW_AND_OLD_IMAGES":
+			case "":
+				streamViewType = "NEW_AND_OLD_IMAGES"
+			default:
+				return nil, ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'streamSpecification.streamViewType' failed to satisfy constraint: Member must satisfy enum value set: [KEYS_ONLY, NEW_AND_OLD_IMAGES, NEW_IMAGE, OLD_IMAGE]", streamViewType)
+			}
+		}
 	}
-	if len(req.KeySchema) == 2 && req.KeySchema[1].KeyType != KeyTypeRange {
-		return nil, ddbErrValidation("Invalid KeySchema: The second KeySchemaElement is not a RANGE key type")
+	table.StreamEnabled = streamEnabled
+	table.StreamViewType = streamViewType
+	if streamEnabled {
+		desc["StreamSpecification"] = map[string]any{"StreamEnabled": true, "StreamViewType": streamViewType}
+		label := time.Now().UTC().Format("2006-01-02T15:04:05.000")
+		desc["LatestStreamLabel"] = label
+		desc["LatestStreamArn"] = arn + "/stream/" + label
 	}
-
-	keyAttrs := []string{req.KeySchema[0].AttributeName}
-	if len(req.KeySchema) == 2 {
-		keyAttrs = append(keyAttrs, req.KeySchema[1].AttributeName)
+	var gsiDescs []map[string]any
+	gsiList, _ := reqListValue(req, "GlobalSecondaryIndexes")
+	for _, el := range gsiList {
+		m, ok := el.(map[string]any)
+		if !ok {
+			return nil, ddbError("ValidationException", "One or more parameter values were invalid: Invalid GlobalSecondaryIndex")
+		}
+		name := reqString(m, "IndexName")
+		if name == "" {
+			return nil, ddbError("ValidationException", "One or more parameter values were invalid: IndexName must be present")
+		}
+		if _, dup := table.GSIs[name]; dup {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: Duplicate index name: %s", name)
+		}
+		ipk, isk, aerr := parseKeySchemaList(m["KeySchema"])
+		if aerr != nil {
+			return nil, aerr
+		}
+		if aerr := checkKeyAttrsDefined(attrDefs, []string{ipk, isk}, name); aerr != nil {
+			return nil, aerr
+		}
+		projType, projAttrs, aerr := parseProjectionDef(m["Projection"])
+		if aerr != nil {
+			return nil, aerr
+		}
+		ircu, iwcu := rcu, wcu
+		if ptm, ok := reqMapValue(m, "ProvisionedThroughput"); ok {
+			ircu, _ = reqIntValue(ptm, "ReadCapacityUnits")
+			iwcu, _ = reqIntValue(ptm, "WriteCapacityUnits")
+		}
+		table.GSIs[name] = &IndexDef{Name: name, PK: ipk, SK: isk, ProjType: projType, ProjAttrs: projAttrs}
+		gd := map[string]any{
+			"IndexName":   name,
+			"KeySchema":   keySchemaDesc(ipk, isk),
+			"Projection":  projDesc(projType, projAttrs),
+			"IndexStatus": "ACTIVE",
+			"IndexArn":    fmt.Sprintf("%s/index/%s", arn, name),
+		}
+		if billing != "PAY_PER_REQUEST" {
+			gd["ProvisionedThroughput"] = ptDesc("PROVISIONED", ircu, iwcu)
+		}
+		gsiDescs = append(gsiDescs, gd)
 	}
-	if missing := missingKeyAttributes(keyAttrs, attrTypes); len(missing) > 0 {
-		return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [%s]",
-			strings.Join(missing, ", ")))
+	var lsiDescs []map[string]any
+	lsiList, _ := reqListValue(req, "LocalSecondaryIndexes")
+	for _, el := range lsiList {
+		m, ok := el.(map[string]any)
+		if !ok {
+			return nil, ddbError("ValidationException", "One or more parameter values were invalid: Invalid LocalSecondaryIndex")
+		}
+		name := reqString(m, "IndexName")
+		if name == "" {
+			return nil, ddbError("ValidationException", "One or more parameter values were invalid: IndexName must be present")
+		}
+		if _, dup := table.LSIs[name]; dup {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: Duplicate index name: %s", name)
+		}
+		ipk, isk, aerr := parseKeySchemaList(m["KeySchema"])
+		if aerr != nil {
+			return nil, aerr
+		}
+		if aerr := checkKeyAttrsDefined(attrDefs, []string{ipk, isk}, name); aerr != nil {
+			return nil, aerr
+		}
+		projType, projAttrs, aerr := parseProjectionDef(m["Projection"])
+		if aerr != nil {
+			return nil, aerr
+		}
+		table.LSIs[name] = &IndexDef{Name: name, PK: ipk, SK: isk, LSI: true, ProjType: projType, ProjAttrs: projAttrs}
+		ld := map[string]any{
+			"IndexName":      name,
+			"KeySchema":      keySchemaDesc(ipk, isk),
+			"Projection":     projDesc(projType, projAttrs),
+			"IndexSizeBytes": 0,
+			"ItemCount":      0,
+			"IndexArn":       fmt.Sprintf("%s/index/%s", arn, name),
+		}
+		lsiDescs = append(lsiDescs, ld)
 	}
-
-	if len(req.GlobalSecondaryIndexes) > 20 {
-		return nil, ddbErrValidation("One or more parameter values were invalid: Number of GlobalSecondaryIndexes exceeds the limit of 20")
+	if len(gsiDescs) > 0 {
+		desc["GlobalSecondaryIndexes"] = gsiDescs
 	}
-	if len(req.LocalSecondaryIndexes) > 5 {
-		return nil, ddbErrValidation("One or more parameter values were invalid: Number of LocalSecondaryIndexes exceeds the limit of 5")
+	if len(lsiDescs) > 0 {
+		desc["LocalSecondaryIndexes"] = lsiDescs
 	}
-
-	gsiRecords := make([]IndexRecord, 0, len(req.GlobalSecondaryIndexes))
-	lsiRecords := make([]IndexRecord, 0, len(req.LocalSecondaryIndexes))
-	indexNames := map[string]bool{}
-
-	for _, gsi := range req.GlobalSecondaryIndexes {
-		if gsi.IndexName == "" {
-			return nil, ddbErrValidation("One or more parameter values were invalid: IndexName is required for GlobalSecondaryIndexes")
-		}
-		if indexNames[gsi.IndexName] {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Duplicate index name: %s", gsi.IndexName))
-		}
-		indexNames[gsi.IndexName] = true
-		if apiErr := indexKeySchemaError(gsi.KeySchema); apiErr != nil {
-			return nil, apiErr
-		}
-		if missing := missingKeyAttributes(indexKeyAttributes(gsi.KeySchema), attrTypes); len(missing) > 0 {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [%s], IndexName: %s",
-				strings.Join(missing, ", "), gsi.IndexName))
-		}
-		projType := "ALL"
-		if gsi.Projection != nil && gsi.Projection.ProjectionType != "" {
-			projType = gsi.Projection.ProjectionType
-		}
-		rec := IndexRecord{
-			Name:           gsi.IndexName,
-			ARN:            s.indexArnOf(name, gsi.IndexName),
-			KeySchema:      gsi.KeySchema,
-			ProjectionType: projType,
-		}
-		if gsi.Projection != nil {
-			rec.NonKeyAttributes = gsi.Projection.NonKeyAttributes
-		}
-		if billing == BillingModeProvisioned && gsi.ProvisionedThroughput != nil {
-			rec.ReadCapacityUnits = gsi.ProvisionedThroughput.ReadCapacityUnits
-			rec.WriteCapacityUnits = gsi.ProvisionedThroughput.WriteCapacityUnits
-		}
-		gsiRecords = append(gsiRecords, rec)
-	}
-
-	for _, lsi := range req.LocalSecondaryIndexes {
-		if lsi.IndexName == "" {
-			return nil, ddbErrValidation("One or more parameter values were invalid: IndexName is required for LocalSecondaryIndexes")
-		}
-		if indexNames[lsi.IndexName] {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Duplicate index name: %s", lsi.IndexName))
-		}
-		indexNames[lsi.IndexName] = true
-		if apiErr := indexKeySchemaError(lsi.KeySchema); apiErr != nil {
-			return nil, apiErr
-		}
-		if lsi.KeySchema[0].AttributeName != keyAttrs[0] {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: LocalSecondaryIndex %s must have the same HASH key attribute as the table", lsi.IndexName))
-		}
-		if missing := missingKeyAttributes(indexKeyAttributes(lsi.KeySchema), attrTypes); len(missing) > 0 {
-			return nil, ddbErrValidation(fmt.Sprintf("One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [%s], IndexName: %s",
-				strings.Join(missing, ", "), lsi.IndexName))
-		}
-		projType := "ALL"
-		if lsi.Projection != nil && lsi.Projection.ProjectionType != "" {
-			projType = lsi.Projection.ProjectionType
-		}
-		rec := IndexRecord{
-			Name:           lsi.IndexName,
-			ARN:            s.indexArnOf(name, lsi.IndexName),
-			KeySchema:      lsi.KeySchema,
-			ProjectionType: projType,
-		}
-		if lsi.Projection != nil {
-			rec.NonKeyAttributes = lsi.Projection.NonKeyAttributes
-		}
-		lsiRecords = append(lsiRecords, rec)
-	}
-
-	tags := make(map[string]string, len(req.Tags))
-	for _, tag := range req.Tags {
-		if tag.Key == "" {
-			return nil, ddbErrValidation("One or more parameter values were invalid: Tag Key cannot be empty")
-		}
-		tags[tag.Key] = tag.Value
-	}
-
-	table := &StoredTable{
-		Name:                      name,
-		Status:                    StatusActive,
-		CreationDateTime:          ddbNow(),
-		TableID:                   ddbTableID(),
-		ARN:                       s.arnOf(name),
-		Region:                    s.region,
-		AccountID:                 s.account,
-		PK:                        keyAttrs[0],
-		KeySchema:                 req.KeySchema,
-		AttributeDefinitions:      req.AttributeDefinitions,
-		BillingMode:               billing,
-		GlobalSecondaryIndexes:    gsiRecords,
-		LocalSecondaryIndexes:     lsiRecords,
-		TableClass:                req.TableClass,
-		DeletionProtectionEnabled: req.DeletionProtectionEnabled,
-		Items:                     map[string]json.RawMessage{},
-	}
-	if len(keyAttrs) == 2 {
-		table.SK = keyAttrs[1]
-	}
-	if billing == BillingModeProvisioned && req.ProvisionedThroughput != nil {
-		table.ReadCapacityUnits = req.ProvisionedThroughput.ReadCapacityUnits
-		table.WriteCapacityUnits = req.ProvisionedThroughput.WriteCapacityUnits
-	}
-	if len(tags) > 0 {
-		table.Tags = tags
-	}
-	return table, nil
+	s.store.tables[tn] = table
+	return map[string]any{"TableDescription": desc}, nil
 }
 
-// indexKeySchemaError validates an index KeySchema (at least one HASH element,
-// at most one RANGE element).
-func indexKeySchemaError(ks []KeySchemaElement) *ddbError {
-	switch {
-	case len(ks) == 0:
-		return ddbErrValidation("One or more parameter values were invalid: The list of KeySchemaElements contains no elements")
-	case len(ks) > 2:
-		return ddbErrValidation("One or more parameter values were invalid: Number of KeySchemaElements exceeds the limit of 2")
-	case ks[0].KeyType != KeyTypeHash:
-		return ddbErrValidation("Invalid Index KeySchema: The first KeySchemaElement is not a HASH key type")
-	case len(ks) == 2 && ks[1].KeyType != KeyTypeRange:
-		return ddbErrValidation("Invalid Index KeySchema: The second KeySchemaElement is not a RANGE key type")
+func nowFloat() float64 {
+	return float64(time.Now().UnixNano()) / 1e9
+}
+
+func attrDefDescs(defs []attrDef) []map[string]any {
+	out := make([]map[string]any, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, map[string]any{"AttributeName": d.name, "AttributeType": d.typ})
+	}
+	return out
+}
+
+func keySchemaDesc(pk, sk string) []map[string]any {
+	out := []map[string]any{{"AttributeName": pk, "KeyType": "HASH"}}
+	if sk != "" {
+		out = append(out, map[string]any{"AttributeName": sk, "KeyType": "RANGE"})
+	}
+	return out
+}
+
+func parseKeySchemaList(v any) (string, string, *apiErr) {
+	list, ok := v.([]any)
+	if !ok {
+		return "", "", ddbError("ValidationException", "One or more parameter values were invalid: KeySchema must be a list")
+	}
+	var pk, sk string
+	for i, el := range list {
+		m, ok := el.(map[string]any)
+		if !ok {
+			return "", "", ddbErrorf("ValidationException", "One or more parameter values were invalid: Invalid KeySchema member at position %d", i+1)
+		}
+		name := reqString(m, "AttributeName")
+		kt := reqString(m, "KeyType")
+		if name == "" {
+			return "", "", ddbErrorf("ValidationException", "One or more parameter values were invalid: AttributeName must be present in KeySchema member %d", i+1)
+		}
+		if kt != "HASH" && kt != "RANGE" {
+			return "", "", ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'keySchema.%d.member.keyType' failed to satisfy constraint: Member must satisfy enum value set: [HASH, RANGE]", kt, i+1)
+		}
+		if kt == "HASH" {
+			if pk != "" {
+				return "", "", ddbError("ValidationException", "One or more parameter values were invalid: The KeySchema contains more than one HASH key element")
+			}
+			pk = name
+		} else {
+			if sk != "" {
+				return "", "", ddbError("ValidationException", "One or more parameter values were invalid: The KeySchema contains more than one RANGE key element")
+			}
+			sk = name
+		}
+	}
+	if pk == "" {
+		return "", "", ddbError("ValidationException", "One or more parameter values were invalid: The KeySchema must contain a HASH key type element")
+	}
+	if pk == sk {
+		return "", "", ddbError("ValidationException", "One or more parameter values were invalid: Both the Hash Key and the Range Key element in the KeySchema cannot have the same name")
+	}
+	return pk, sk, nil
+}
+
+func checkKeyAttrsDefined(attrDefs map[string]string, names []string, indexName string) *apiErr {
+	var missing []string
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if _, ok := attrDefs[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return ddbErrorf("ValidationException", "One or more parameter values were invalid: Some index key attributes are not defined in AttributeDefinitions. Keys: [%s], IndexName: %s", strings.Join(missing, ", "), indexName)
 	}
 	return nil
 }
 
-// indexKeyAttributes returns the attribute names referenced by a key schema.
-func indexKeyAttributes(ks []KeySchemaElement) []string {
-	out := make([]string, 0, len(ks))
-	for _, el := range ks {
-		out = append(out, el.AttributeName)
+func ptDesc(billing string, rcu, wcu int64) map[string]any {
+	if billing == "PAY_PER_REQUEST" {
+		return map[string]any{"NumberOfDecreasesToday": 0}
 	}
-	return out
+	return map[string]any{"NumberOfDecreasesToday": 0, "ReadCapacityUnits": rcu, "WriteCapacityUnits": wcu}
 }
 
-// missingKeyAttributes returns the sorted names from keys absent from defined.
-func missingKeyAttributes(keys []string, defined map[string]string) []string {
-	var missing []string
-	for _, key := range keys {
-		if _, ok := defined[key]; !ok {
-			missing = append(missing, key)
+func parseProjectionDef(v any) (string, []string, *apiErr) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", nil, ddbError("ValidationException", "One or more parameter values were invalid: Projection must be a map")
+	}
+	pt := reqString(m, "ProjectionType")
+	if pt == "" {
+		pt = "ALL"
+	}
+	if pt != "ALL" && pt != "KEYS_ONLY" && pt != "INCLUDE" {
+		return "", nil, ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'projection.projectionType' failed to satisfy constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]", pt)
+	}
+	var attrs []string
+	if lst, ok := reqListValue(m, "NonKeyAttributes"); ok {
+		for _, el := range lst {
+			s, _ := el.(string)
+			attrs = append(attrs, s)
 		}
 	}
-	sort.Strings(missing)
-	return missing
+	if pt == "INCLUDE" && len(attrs) == 0 {
+		return "", nil, ddbError("ValidationException", "One or more parameter values were invalid: NonKeyAttributes must be present when ProjectionType is INCLUDE")
+	}
+	return pt, attrs, nil
 }
 
-// describeTable renders the wire TableDescription for a stored table.
-func (s *TableService) describeTable(t *StoredTable) *tableDescription {
-	desc := &tableDescription{
-		TableName:                 t.Name,
-		TableStatus:               t.Status,
-		CreationDateTime:          t.CreationDateTime,
-		TableArn:                  t.ARN,
-		TableId:                   t.TableID,
-		AttributeDefinitions:      t.AttributeDefinitions,
-		KeySchema:                 t.KeySchema,
-		ProvisionedThroughput:     &provisionedThroughputDesc{ReadCapacityUnits: t.ReadCapacityUnits, WriteCapacityUnits: t.WriteCapacityUnits},
-		GlobalSecondaryIndexes:    indexDescriptions(t.GlobalSecondaryIndexes, true, t.BillingMode == BillingModeProvisioned),
-		LocalSecondaryIndexes:     indexDescriptions(t.LocalSecondaryIndexes, false, false),
-		ItemCount:                 int64(len(t.Items)),
-		DeletionProtectionEnabled: t.DeletionProtectionEnabled,
+func projDesc(pt string, attrs []string) map[string]any {
+	d := map[string]any{"ProjectionType": pt}
+	if pt == "INCLUDE" {
+		d["NonKeyAttributes"] = attrs
 	}
-	if t.BillingMode == BillingModePayPerRequest {
-		desc.BillingModeSummary = &billingModeSummary{BillingMode: t.BillingMode}
-	}
-	if t.TableClass != "" {
-		desc.TableClassSummary = &tableClassSummary{TableClass: t.TableClass}
-	}
-	return desc
-}
-
-// indexDescriptions renders stored index records into wire descriptions.
-func indexDescriptions(recs []IndexRecord, global, provisioned bool) []indexDescription {
-	if len(recs) == 0 {
-		return nil
-	}
-	out := make([]indexDescription, 0, len(recs))
-	for _, rec := range recs {
-		projType := rec.ProjectionType
-		if projType == "" {
-			projType = "ALL"
-		}
-		desc := indexDescription{
-			IndexName:      rec.Name,
-			IndexArn:       rec.ARN,
-			IndexSizeBytes: 0,
-			ItemCount:      0,
-			KeySchema:      rec.KeySchema,
-			Projection:     &projectionIn{ProjectionType: projType, NonKeyAttributes: rec.NonKeyAttributes},
-		}
-		if global {
-			desc.IndexStatus = StatusActive
-			if provisioned {
-				desc.ProvisionedThroughput = &provisionedThroughputDesc{
-					ReadCapacityUnits:  rec.ReadCapacityUnits,
-					WriteCapacityUnits: rec.WriteCapacityUnits,
-				}
-			}
-		}
-		out = append(out, desc)
-	}
-	return out
+	return d
 }

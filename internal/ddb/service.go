@@ -1,140 +1,257 @@
+// Package ddb implements an in-memory, wire-compatible DynamoDB service
+// speaking the awsJson 1.1 protocol (DynamoDB_20120810 targets).
 package ddb
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"strconv"
 	"strings"
 )
 
-// ddbTargetPrefix is the X-Amz-Target prefix of the DynamoDB JSON API revision.
-const ddbTargetPrefix = "DynamoDB_20120810."
+const targetPrefix = "DynamoDB_20120810."
 
-// ddbContentTypeJSON is the Amazon JSON 1.0 protocol media type.
-const ddbContentTypeJSON = "application/x-amz-json-1.0"
+const msgBadTableName = "One or more parameter values were invalid: TableName must be at least 3 characters long and at most 255 characters long"
 
-// ddbError is a DynamoDB protocol error. Code is the error name without the
-// fully-qualified __type prefix; Status is the HTTP response status.
-type ddbError struct {
-	Status  int
-	Code    string
-	Message string
+// Service is the DynamoDB-compatible HTTP service.
+type Service struct {
+	store *Store
 }
 
-func (e *ddbError) Error() string { return e.Code + ": " + e.Message }
-
-// ddbErrValidation builds a 400 ValidationException.
-func ddbErrValidation(msg string) *ddbError {
-	return &ddbError{Status: http.StatusBadRequest, Code: "ValidationException", Message: msg}
-}
-
-// TableService serves the DynamoDB operations implemented by this package as
-// a single http.Handler speaking the Amazon JSON 1.0 protocol. Mount it at
-// the DynamoDB endpoint of the floci mux (routing happens on X-Amz-Target).
-type TableService struct {
-	store   *TableStore
-	region  string
-	account string
-}
-
-// NewTableService mounts the service over the table store rooted at dataDir;
-// an empty dataDir selects $FLOCI_DATA_DIR or .floci.
-func NewTableService(dataDir string) (*TableService, error) {
-	store, err := OpenTableStore(dataDir)
-	if err != nil {
-		return nil, err
-	}
-	return &TableService{store: store, region: ddbDefaultRegion(), account: ddbDefaultAccount()}, nil
-}
-
-// Store exposes the backing table store (for reading persisted tables).
-func (s *TableService) Store() *TableStore { return s.store }
-
-// arnOf builds a table ARN for the emulator region/account.
-func (s *TableService) arnOf(name string) string {
-	return fmt.Sprintf("arn:aws:dynamodb:%s:%s:table/%s", s.region, s.account, name)
-}
-
-// indexArnOf builds an index ARN below a table ARN.
-func (s *TableService) indexArnOf(table, index string) string {
-	return s.arnOf(table) + "/index/" + index
-}
-
-func ddbDefaultRegion() string {
-	for _, key := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
-		if r := os.Getenv(key); r != "" {
-			return r
+// New creates a Service over a fresh in-memory store. Any arguments are
+// tolerated; a *Store passed as an argument is used as the backing state.
+func New(args ...any) *Service {
+	for _, a := range args {
+		if st, ok := a.(*Store); ok && st != nil {
+			return &Service{store: st}
 		}
 	}
-	return "us-east-1"
+	return &Service{store: newStore()}
 }
 
-func ddbDefaultAccount() string {
-	if a := os.Getenv("FLOCI_ACCOUNT_ID"); a != "" {
-		return a
+// NewService is an alias for New.
+func NewService(args ...any) *Service { return New(args...) }
+
+// NewStore creates a fresh backing store.
+func NewStore(args ...any) *Store { return newStore() }
+
+// ServeHTTP dispatches awsJson requests by X-Amz-Target.
+func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	op := strings.TrimPrefix(r.Header.Get("X-Amz-Target"), targetPrefix)
+	switch op {
+	case "CreateTable":
+		s.createTable(w, r)
+	case "GetItem":
+		s.getItem(w, r)
+	case "PutItem":
+		s.putItem(w, r)
+	case "DeleteItem":
+		s.deleteItem(w, r)
+	case "UpdateItem":
+		t.updateItemGuard(w, r)
+	case "Query":
+		s.query(w, r)
+	default:
+		w.Header().Set("X-Amzn-Errortype", "UnknownOperationException")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"__type": "UnknownOperationException"})
 	}
-	return "000000000000"
 }
 
-// ServeHTTP dispatches the JSON protocol request on the X-Amz-Target header.
-func (s *TableService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		ddbWriteError(w, &ddbError{Status: http.StatusBadRequest, Code: "SerializationException"})
-		return
+// apiErr describes a wire error.
+type apiErr struct {
+	Code  string
+	Msg   string
+	Extra map[string]any
+}
+
+func ddbError(code, msg string) *apiErr { return &apiErr{Code: code, Msg: msg} }
+
+func ddbErrorf(code, format string, args ...any) *apiErr {
+	return &apiErr{Code: code, Msg: fmt.Sprintf(format, args...)}
+}
+
+func ddbWriteResult(w http.ResponseWriter, out map[string]any) {
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func ddbWriteError(w http.ResponseWriter, aerr *apiErr) {
+	status := http.StatusBadRequest
+	if aerr.Code == "InternalServerError" {
+		status = http.StatusInternalServerError
+	} else if aerr.Code == "ServiceUnavailable" {
+		status = http.StatusServiceUnavailable
 	}
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	w.Header().Set("X-Amzn-Errortype", aerr.Code)
+	w.WriteHeader(status)
+	body := map[string]any{
+		"__type":  "com.amazonaws.dynamodb.v20120810#" + aerr.Code,
+		"message": aerr.Msg,
+	}
+	for k, v := range aerr.Extra {
+		body[k] = v
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func ddbDecodeRequest(r *http.Request) (map[string]any, *apiErr) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		ddbWriteError(w, &ddbError{Status: http.StatusBadRequest, Code: "SerializationException"})
-		return
+		return nil, ddbError("SerializationException", "Unexpected error while parsing request body")
 	}
-	target := strings.TrimSpace(r.Header.Get("X-Amz-Target"))
-	switch operation := strings.TrimPrefix(target, ddbTargetPrefix); operation {
-	case "CreateTable":
-		s.serveCreateTable(w, body)
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, ddbError("SerializationException", "Unexpected error while parsing request body")
+	}
+	if v == nil {
+		return nil, ddbError("SerializationException", "Unexpected error while parsing request body")
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, ddbError("SerializationException", "Unexpected error while parsing request body")
+	}
+	return m, nil
+}
+
+func reqString(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	s, _ := m[key].(string)
+	return s
+}
+
+func reqHas(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
+}
+
+func reqMapValue(m map[string]any, key string) (map[string]any, bool) {
+	if m == nil {
+		return nil, false
+	}
+	v, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	mm, ok := v.(map[string]any)
+	return mm, ok
+}
+
+func reqListValue(m map[string]any, key string) ([]any, bool) {
+	if m == nil {
+		return nil, false
+	}
+	v, ok := m[key]
+	if !ok {
+		return nil, false
+	}
+	l, ok := v.([]any)
+	return l, ok
+}
+
+func reqBoolValue(m map[string]any, key string) (bool, bool) {
+	if m == nil {
+		return false, false
+	}
+	v, ok := m[key]
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	return b, ok
+}
+
+func reqIntValue(m map[string]any, key string) (int64, bool) {
+	if m == nil {
+		return 0, false
+	}
+	v, ok := m[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	case float64:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		return i, err == nil
+	}
+	return 0, false
+}
+
+func reqValueString(v any) string {
+	switch n := v.(type) {
+	case json.Number:
+		return n.String()
+	case float64:
+		return strconv.FormatFloat(n, 'g', -1, 64)
+	case bool:
+		return strconv.FormatBool(n)
+	case string:
+		return n
 	default:
-		ddbWriteError(w, &ddbError{Status: http.StatusBadRequest, Code: "UnknownOperationException"})
+		return fmt.Sprintf("%v", v)
 	}
 }
 
-// ddbWriteResponse flushes a successful JSON protocol response.
-func ddbWriteResponse(w http.ResponseWriter, value any) {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		ddbWriteError(w, &ddbError{Status: http.StatusInternalServerError, Code: "InternalServerError", Message: err.Error()})
-		return
-	}
-	header := w.Header()
-	header.Set("Content-Type", ddbContentTypeJSON)
-	header.Set("X-Amzn-Requestid", ddbRequestID())
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(raw)
+func consumedCapacity(tn string, units float64) map[string]any {
+	return map[string]any{"TableName": tn, "CapacityUnits": units}
 }
 
-// ddbWriteError flushes a JSON protocol error (__type/message + headers).
-func ddbWriteError(w http.ResponseWriter, apiErr *ddbError) {
-	prefix := "com.amazonaws.dynamodb.v20120810"
-	switch apiErr.Code {
-	case "UnknownOperationException", "SerializationException":
-		prefix = "com.amazon.coral.service"
+func addConsumedCapacity(out map[string]any, rcc, tn string, units float64) {
+	if rcc == "TOTAL" || rcc == "INDEXES" {
+		out["ConsumedCapacity"] = consumedCapacity(tn, units)
 	}
-	wire := struct {
-		Type    string `json:"__type"`
-		Message string `json:"message,omitempty"`
-	}{Type: prefix + "#" + apiErr.Code, Message: apiErr.Message}
-	raw, _ := json.Marshal(wire)
-	header := w.Header()
-	header.Set("Content-Type", ddbContentTypeJSON)
-	if apiErr.Code != "" {
-		header.Set("X-Amzn-ErrorType", apiErr.Code)
-	}
-	header.Set("X-Amzn-Requestid", ddbRequestID())
-	w.WriteHeader(apiErr.Status)
-	_, _ = w.Write(raw)
 }
 
-// ddbRequestID mimics an Amazon request id.
-func ddbRequestID() string {
-	return ddbRandHex(16)
+var returnValuesEnum = map[string]bool{
+	"NONE": true, "ALL_OLD": true, "UPDATED_OLD": true, "ALL_NEW": true, "UPDATED_NEW": true,
+}
+
+func checkReturnValues(v string) *apiErr {
+	if v == "" || returnValuesEnum[v] {
+		return nil
+	}
+	return ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'returnValues' failed to satisfy constraint: Member must satisfy enum value set: [ALL_NEW, ALL_OLD, NONE, UPDATED_NEW, UPDATED_OLD]", v)
+}
+
+func checkRCC(v string) *apiErr {
+	if v == "" || v == "NONE" || v == "TOTAL" || v == "INDEXES" {
+		return nil
+	}
+	return ddbErrorf("ValidationException", "1 validation error detected: Value '%s' at 'returnConsumedCapacity' failed to satisfy constraint: Member must satisfy enum value set: [INDEXES, NONE, TOTAL]", v)
+}
+
+func conditionFailed(req map[string]any, prev map[string]any, hasPrev bool) *apiErr {
+	extra := map[string]any{}
+	if reqString(req, "ReturnValuesOnConditionCheckFailure") == "ALL_OLD" && hasPrev {
+		extra["Item"] = prev
+	}
+	return &apiErr{Code: "ConditionalCheckFailedException", Msg: "The conditional request failed", Extra: extra}
+}
+
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

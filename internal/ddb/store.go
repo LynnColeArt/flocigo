@@ -1,263 +1,319 @@
-// Package ddb implements a DynamoDB emulator surface. Table definitions (with
-// their pk/sk primary-key schema) are persisted in a JSON store file under the
-// floci data directory, and the operations of this package are served over the
-// Amazon JSON 1.0 protocol (X-Amz-Target: DynamoDB_20120810.*).
 package ddb
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
-	"time"
 )
 
-// Table status. Freshly created tables are reported as ACTIVE.
-const StatusActive = "ACTIVE"
-
-// Key schema roles.
-const (
-	KeyTypeHash  = "HASH"
-	KeyTypeRange = "RANGE"
-)
-
-// Billing modes.
-const (
-	BillingModeProvisioned   = "PROVISIONED"
-	BillingModePayPerRequest = "PAY_PER_REQUEST"
-)
-
-// ErrResourceInUse is returned when a table name is already present in the
-// store; the wire layer maps it to ResourceInUseException.
-var ErrResourceInUse = errors.New("ddb: table already exists")
-
-// KeySchemaElement is one HASH/RANGE component of a table or index key.
-type KeySchemaElement struct {
-	AttributeName string `json:"AttributeName"`
-	KeyType       string `json:"KeyType"`
+// entry is a partition-scoped item with its pk/sk values.
+type entry struct {
+	pk, sk map[string]any
+	item   map[string]any
 }
 
-// AttributeDefinition declares the scalar type of a key attribute (S, N or B).
-type AttributeDefinition struct {
-	AttributeName string `json:"AttributeName"`
-	AttributeType string `json:"AttributeType"`
+// IndexDef describes a local or global secondary index.
+type IndexDef struct {
+	Name      string
+	PK, SK    string
+	LSI       bool
+	ProjType  string
+	ProjAttrs []string
 }
 
-// IndexRecord is the persisted form of a GSI/LSI definition.
-type IndexRecord struct {
-	Name               string             `json:"name"`
-	ARN                string             `json:"arn"`
-	KeySchema          []KeySchemaElement `json:"keySchema"`
-	ProjectionType     string             `json:"projectionType,omitempty"`
-	NonKeyAttributes   []string           `json:"nonKeyAttributes,omitempty"`
-	ReadCapacityUnits  int64              `json:"readCapacityUnits,omitempty"`
-	WriteCapacityUnits int64              `json:"writeCapacityUnits,omitempty"`
+// Table holds the stored items of one table plus its indexes.
+type Table struct {
+	Name           string
+	AttrDefs       map[string]string
+	PK, SK         string
+	LSIs           map[string]*IndexDef
+	GSIs           map[string]*IndexDef
+	BillingMode    string
+	RCU, WCU       int64
+	StreamEnabled  bool
+	StreamViewType string
+	Created        float64
+	TableID        string
+	Items          map[string]map[string]any
+	IndexItems     map[string]map[string]map[string]any
 }
 
-// StoredTable is the persisted record of one table inside the store file. PK
-// and SK hold the pk (HASH) and sk (RANGE) attribute names extracted from the
-// key schema so later operations can address items without re-parsing KeySchema.
-type StoredTable struct {
-	Name                      string                     `json:"name"`
-	Status                    string                     `json:"status"`
-	CreationDateTime          float64                    `json:"creationDateTime"`
-	TableID                   string                     `json:"tableId"`
-	ARN                       string                     `json:"arn"`
-	Region                    string                     `json:"region"`
-	AccountID                 string                     `json:"accountId"`
-	PK                        string                     `json:"pk"`
-	SK                        string                     `json:"sk,omitempty"`
-	KeySchema                 []KeySchemaElement         `json:"keySchema"`
-	AttributeDefinitions      []AttributeDefinition      `json:"attributeDefinitions"`
-	BillingMode               string                     `json:"billingMode"`
-	ReadCapacityUnits         int64                      `json:"readCapacityUnits,omitempty"`
-	WriteCapacityUnits        int64                      `json:"writeCapacityUnits,omitempty"`
-	GlobalSecondaryIndexes    []IndexRecord              `json:"gsis,omitempty"`
-	LocalSecondaryIndexes     []IndexRecord              `json:"lsis,omitempty"`
-	TableClass                string                     `json:"tableClass,omitempty"`
-	DeletionProtectionEnabled bool                       `json:"deletionProtectionEnabled"`
-	Tags                      map[string]string          `json:"tags,omitempty"`
-	Items                     map[string]json.RawMessage `json:"items"`
+// Store is the backing state: table name to table.
+type Store struct {
+	mu     sync.RWMutex
+	tables map[string]*Table
 }
 
-// HashKey returns the pk (HASH) attribute name of the table.
-func (t *StoredTable) HashKey() string { return t.PK }
+func newStore() *Store {
+	return &Store{tables: make(map[string]*Table)}
+}
 
-// RangeKey returns the sk (RANGE) attribute name and whether the table has one.
-func (t *StoredTable) RangeKey() (string, bool) {
-	if t.SK == "" {
+// GetTable returns a table by name.
+func (st *Store) GetTable(name string) (*Table, bool) {
+	t, ok := st.tables[name]
+	return t, ok
+}
+
+// TableExists reports whether a table exists.
+func (st *Store) TableExists(name string) bool {
+	_, ok := st.tables[name]
+	return ok
+}
+
+// keyIDOf builds a unique, typed identifier for a key attribute value.
+func keyIDOf(a map[string]any) string {
+	switch t := attrTypeOf(a); t {
+	case "S":
+		v := attrString(a)
+		return "S" + strconv.Itoa(len(v)) + ":" + v
+	case "N":
+		if r, ok := parseNumber(attrString(a)); ok {
+			return "N" + r.RatString()
+		}
+		return "N!" + attrString(a)
+	case "B":
+		b := attrBytes(a)
+		return "B" + strconv.Itoa(len(b)) + ":" + string(b)
+	default:
+		return "X"
+	}
+}
+
+// storageKeyFor computes the storage key of an item for the base table.
+func storageKeyFor(pk, sk string, item map[string]any) string {
+	id := keyIDOf(item[pk])
+	if sk != "" {
+		id += "\x00" + keyIDOf(item[sk])
+	}
+	return id
+}
+
+// indexStorageKey computes the storage key of an item for an index.
+// It reports false for sparse entries (missing index key attributes).
+func indexStorageKey(idx *IndexDef, item map[string]any) (string, bool) {
+	 pkv, ok := item[idx.PK]
+	if !ok {
 		return "", false
 	}
-	return t.SK, true
-}
-
-// ItemKey composes the store-file key for an item from its pk/sk values.
-func (t *StoredTable) ItemKey(pk, sk string) string {
-	if _, has := t.RangeKey(); !has {
-		return pk
-	}
-	return pk + "#" + sk
-}
-
-type tableStoreFile struct {
-	Version int                     `json:"version"`
-	Tables  map[string]*StoredTable `json:"tables"`
-}
-
-// TableStore owns the tables.json store file under <dataDir>/ddb/. Lookups
-// and mutations are serialized through a mutex and every mutation flushes the
-// file so table definitions survive emulator restarts.
-type TableStore struct {
-	mu     sync.Mutex
-	path   string
-	tables map[string]*StoredTable
-}
-
-// DefaultDataDir resolves the emulator data directory: $FLOCI_DATA_DIR or ".floci".
-func DefaultDataDir() string {
-	if dir := os.Getenv("FLOCI_DATA_DIR"); dir != "" {
-		return dir
-	}
-	return ".floci"
-}
-
-// OpenTableStore loads (or creates) the store file under dataDir/ddb/. An
-// empty dataDir falls back to DefaultDataDir.
-func OpenTableStore(dataDir string) (*TableStore, error) {
-	if dataDir == "" {
-		dataDir = DefaultDataDir()
-	}
-	path := filepath.Join(dataDir, "ddb", "tables.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("ddb: create store directory: %w", err)
-	}
-	s := &TableStore{path: path, tables: map[string]*StoredTable{}}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return s, nil
+	id := keyIDOf(pkv)
+	if idx.SK != "" {
+		skv, ok2 := item[idx.SK]
+		if !ok2 {
+			return "", false
 		}
-		return nil, fmt.Errorf("ddb: read store file: %w", err)
+		id += "\x00" + keyIDOf(skv)
 	}
-	if len(bytes.TrimSpace(raw)) > 0 {
-		var file tableStoreFile
-		if err := json.Unmarshal(raw, &file); err != nil {
-			return nil, fmt.Errorf("ddb: parse %s: %w", path, err)
-		}
-		for _, t := range file.Tables {
-			if t == nil || t.Name == "" {
-				continue
-			}
-			if t.Items == nil {
-				t.Items = map[string]json.RawMessage{}
-			}
-			if t.Status == "" {
-				t.Status = StatusActive
-			}
-			s.tables[t.Name] = t
-		}
-	}
-	return s, nil
+	return id, true
 }
 
-// Path returns the location of the underlying store file.
-func (s *TableStore) Path() string { return s.path }
-
-// CreateTable records a new table and persists it to the store file. When the
-// name is already present it returns ErrResourceInUse and leaves the store
-// untouched.
-func (s *TableStore) CreateTable(t *StoredTable) (*StoredTable, error) {
-	if t == nil || t.Name == "" {
-		return nil, errors.New("ddb: table name is required")
+func (t *Table) indexMap(name string) map[string]map[string]any {
+	if t.IndexItems == nil {
+		t.IndexItems = map[string]map[string]map[string]any{}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.tables == nil {
-		s.tables = map[string]*StoredTable{}
-	}
-	if _, exists := s.tables[t.Name]; exists {
-		return nil, ErrResourceInUse
-	}
-	stored := *t
-	stored.Status = StatusActive
-	if stored.Items == nil {
-		stored.Items = map[string]json.RawMessage{}
-	}
-	s.tables[t.Name] = &stored
-	if err := s.flushLocked(); err != nil {
-		delete(s.tables, t.Name)
-		return nil, err
-	}
-	out := stored
-	return &out, nil
-}
-
-// GetTable returns a snapshot of the stored table by exact name.
-func (s *TableStore) GetTable(name string) (StoredTable, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.tables[name]
+	m, ok := t.IndexItems[name]
 	if !ok {
-		return StoredTable{}, false
+		m = map[string]map[string]any{}
+		t.IndexItems[name] = m
 	}
-	return *t, true
+	return m
 }
 
-// ListTables returns every stored table ordered by name.
-func (s *TableStore) ListTables() []StoredTable {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	names := make([]string, 0, len(s.tables))
-	for name := range s.tables {
-		names = append(names, name)
+func (t *Table) addIndexEntries(item map[string]any) {
+	for _, idx := range t.GSIs {
+		if k, ok := indexStorageKey(idx, item); ok {
+			t.indexMap(idx.Name)[k] = item
+		}
 	}
-	sort.Strings(names)
-	out := make([]StoredTable, 0, len(names))
-	for _, name := range names {
-		out = append(out, *s.tables[name])
+	for _, idx := range t.LSIs {
+		if k, ok := indexStorageKey(idx, item); ok {
+			t.indexMap(idx.Name)[k] = item
+		}
+	}
+}
+
+func (t *Table) removeIndexEntries(item map[string]any) {
+	for _, idx := range t.GSIs {
+		if k, ok := indexStorageKey(idx, item); ok {
+			if m, ok2 := t.IndexItems[idx.Name]; ok2 {
+				delete(m, k)
+			}
+		}
+	}
+	for _, idx := range t.LSIs {
+		if k, ok := indexStorageKey(idx, item); ok {
+			if m, ok2 := t.IndexItems[idx.Name]; ok2 {
+				delete(m, k)
+			}
+		}
+	}
+}
+
+// putItem stores an item, returning the previous item if one was replaced.
+func (t *Table) putItem(item map[string]any) (map[string]any, bool) {
+	id := storageKeyFor(t.PK, t.SK, item)
+	prev, replaced := t.Items[id]
+	if replaced {
+		t.removeIndexEntries(prev)
+	}
+	t.Items[id] = item
+	t.addIndexEntries(item)
+	return prev, replaced
+}
+
+// getItem returns the item stored under the given key.
+func (t *Table) getItem(key map[string]any) (map[string]any, bool) {
+	id := storageKeyFor(t.PK, t.SK, key)
+	it, ok := t.Items[id]
+	return it, ok
+}
+
+// deleteItem removes an item, returning the deleted item if it existed.
+func (t *Table) deleteItem(key map[string]any) (map[string]any, bool) {
+	id := storageKeyFor(t.PK, t.SK, key)
+	prev, ok := t.Items[id]
+	if !ok {
+		return nil, false
+	}
+	delete(t.Items, id)
+	t.removeIndexEntries(prev)
+	return prev, true
+}
+
+// partitionEntries returns the items of one partition, sorted by sort key.
+func (t *Table) partitionEntries(idxName string, pk map[string]any) []entry {
+	ipk, isk := t.PK, t.SK
+	var src map[string]map[string]any
+	if idxName == "" {
+		src = t.Items
+	} else {
+		idx := t.GSIs[idxName]
+		if idx == nil {
+			idx = t.LSIs[idxName]
+		}
+		if idx == nil {
+			return nil
+		}
+		ipk, isk = idx.PK, idx.SK
+		m, ok := t.IndexItems[idxName]
+		if !ok {
+			return nil
+		}
+		src = m
+	}
+	pkID := keyIDOf(pk)
+	out := make([]entry, 0, 8)
+	for _, item := range src {
+		if keyIDOf(item[ipk]) != pkID {
+			continue
+		}
+		e := entry{pk: item[ipk], item: item}
+		if isk != "" {
+			e.sk = item[isk]
+		}
+		out = append(out, e)
+	}
+	if isk != "" {
+		sort.SliceStable(out, func(i, j int) bool {
+			return compareAttr(out[i].sk, out[j].sk) < 0
+		})
 	}
 	return out
 }
 
-// flushLocked atomically rewrites the store file; the caller holds s.mu.
-func (s *TableStore) flushLocked() error {
-	file := tableStoreFile{Version: 1, Tables: s.tables}
-	raw, err := json.MarshalIndent(file, "", "  ")
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return fmt.Errorf("ddb: write store file: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("ddb: replace store file: %w", err)
+// validKeyValue validates a key attribute value.
+func validKeyValue(a map[string]any, name string) *apiErr {
+	switch attrTypeOf(a) {
+	case "S":
+		if attrString(a) == "" {
+			return ddbErrorf("ValidationException", "One or more parameter values were invalid: The AttributeValue for a key attribute cannot contain an empty string value. Key: %s", name)
+		}
+	case "N":
+		if _, ok := parseNumber(attrString(a)); !ok {
+			return ddbError("ValidationException", "The provided key element does not match the schema")
+		}
 	}
 	return nil
 }
 
-// ddbNow returns the current UTC time as an epoch-seconds float (ms precision).
-func ddbNow() float64 {
-	return float64(time.Now().UTC().UnixMilli()) / 1000
-}
-
-// ddbRandHex returns n random bytes hex encoded.
-func ddbRandHex(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("%x", time.Now().UnixNano())
+// itemKeyFromAttrs extracts & validates the primary key of an item.
+func itemKeyFromAttrs(t *Table, item map[string]any) (map[string]any, *apiErr) {
+	key := map[string]any{}
+	names := []string{t.PK}
+	if t.SK != "" {
+		names = append(names, t.SK)
 	}
-	return hex.EncodeToString(buf)
+	for _, name := range names {
+		v, ok := item[name]
+		if !ok {
+			return nil, ddbErrorf("ValidationException", "One or more parameter values were invalid: Missing the key %s in the item", name)
+		}
+		a, ok2 := toAttr(v)
+		if !ok2 || attrTypeOf(a) != t.AttrDefs[name] {
+			return nil, ddbError("ValidationException", "The provided key element does not match the schema")
+		}
+		if aerr := validKeyValue(a, name); aerr != nil {
+			return nil, aerr
+		}
+		key[name] = a
+	}
+	return key, nil
 }
 
-// ddbTableID generates a UUID-shaped table id.
-func ddbTableID() string {
-	return fmt.Sprintf("%s-%s-%s-%s-%s", ddbRandHex(4), ddbRandHex(2), ddbRandHex(2), ddbRandHex(2), ddbRandHex(6))
+// itemKeyFromKeyParam extracts & validates a Key request parameter.
+func itemKeyFromKeyParam(t *Table, m map[string]any) (map[string]any, *apiErr) {
+	if m == nil {
+		m = map[string]any{}
+	}
+	key, aerr := itemKeyFromAttrs(t, m)
+	if aerr != nil {
+		return nil, aerr
+	}
+	allowed := 1
+	if t.SK != "" {
+		allowed = 2
+	}
+	if len(m) > allowed {
+		return nil, ddbError("ValidationException", "The provided key element does not match the schema")
+	}
+	return key, nil
+}
+
+// checkIndexKeyTypes validates index key attribute types when present.
+func checkIndexKeyTypes(t *Table, item map[string]any) *apiErr {
+	for _, idx := range t.GSIs {
+		if aerr := checkOneIndexKey(t, idx, item); aerr != nil {
+			return aerr
+		}
+	}
+	for _, idx := range t.LSIs {
+		if aerr := checkOneIndexKey(t, idx, item); aerr != nil {
+			return aerr
+		}
+	}
+	return nil
+}
+
+func checkOneIndexKey(t *Table, idx *IndexDef, item map[string]any) *apiErr {
+	for _, name := range []string{idx.PK, idx.SK} {
+		if name == "" {
+			continue
+		}
+		v, ok := item[name]
+		if !ok {
+			continue
+		}
+		a, ok2 := toAttr(v)
+		if !ok2 || attrTypeOf(a) != t.AttrDefs[name] {
+			expected := t.AttrDefs[name]
+			actual := ""
+			if ok2 {
+				actual = attrTypeOf(a)
+			}
+			if actual == "" || expected == "" {
+				return ddbError("ValidationException", "The provided key element does not match the schema")
+			}
+			return ddbErrorf("ValidationException", "One or more parameter values were invalid: Type mismatch for Index Key %s Expected: %s Actual: %s Index: %s", name, expected, actual, t.Name)
+		}
+	}
+	return nil
 }
